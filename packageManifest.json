@@ -1,0 +1,18 @@
+{
+	"packageName": "Hubitat Bestin",
+	"minimumHEVersion": "2.3.9",
+	"author": "Luke Lee",
+	"version": "0.0.1",
+	"dateReleased": "2024-06-30",
+	"licenseFile": "https://raw.githubusercontent.com/zekaizer/HubitatBestin/main/LICENSE",
+	"releaseNotes": "",
+	"drivers" : [
+		{
+			"id": "a8bab504-a788-4ba0-8188-9cd85b7ea33a",
+			"name": "Hubitat Bestin",
+			"namespace": "abc.reqdriver",
+			"location": "https://raw.githubusercontent.com/zekaizer/HubitatBestin/main/drivers/BestinComponentParent.groovy",
+			"required": true
+		}
+	]
+}

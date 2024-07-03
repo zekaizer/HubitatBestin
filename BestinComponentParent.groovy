@@ -40,9 +40,10 @@ preferences {
 }
 
 def initialize() {
+    unschedule()
     state.pendingCommands = [:]
     state.msgNoCounter = new Random().nextInt(999999) + 1
-    runIn(1, "checkCommandTimeouts")
+    schedule("*/1 * * ? * *", "checkCommandTimeouts")
 }
 
 def parse(String description) {
@@ -56,7 +57,7 @@ def parse(String description) {
 
 def checkCommandTimeouts() {
     def now = new Date().time
-    def timeoutThreshold = 3 // 3초 timeout
+    def timeoutThreshold = 10
 
     state.pendingCommands.each { msgNo, command ->
         if (now - command.time > timeoutThreshold * 1000) {
