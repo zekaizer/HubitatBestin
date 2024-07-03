@@ -1,142 +1,356 @@
-/*
-    Bestin Component Parent
-*/
+import hubitat.device.HubAction
+import hubitat.device.Protocol
+import groovy.time.TimeCategory
 
 metadata {
-    definition (name: "Bestin Component Parent", namespace: "bestin", author: "Luke Lee") {
+    definition (name: "Hubitat Bestin", namespace: "bestin", author: "Luke Lee") {
         capability "Configuration"
         
-        //demo commands, these will create the appropriate component device if it doesn't already exist...
-        command "childSwitchOn"
-        command "childSwitchOff"
-        command "childDimmerOn"
-        command "childDimmerOff"
-        command "childDimmerSetLevel", ["number"]
-        command "setTemperature", ["number"]
-        
+        command "setLightState", [
+            [name: "Device Name", type: "ENUM", constraints: ['batchlight', 'livinglight', 'light01', 'light02', 'light03', 'light04']],
+            [name: "Device Number", type: "NUMBER", description: "Number of the device"],
+            [name: "Light State", type: "ENUM", constraints: ["on", "off"]]
+        ]
+        command "setTemperature", [
+            [name: "Device Name", type: "ENUM", constraints: ['temper']],
+            [name: "Device Number", type: "NUMBER", description: "Number of the device"],
+            [name: "Temperature", type: "NUMBER", description: "Set temperature in Celsius"]
+        ]
+        command "setThermostatMode", [
+            [name: "Device Name", type: "ENUM", constraints: ['temper']],
+            [name: "Device Number", type: "NUMBER", description: "Number of the device"],
+            [name: "Thermostat Mode", type: "ENUM", constraints: ["heat", "cool", "auto", "off"]]
+        ]
+        command "controlAirVentilator", [
+            [name: "Device Name", type: "ENUM", constraints: ['ventil']],
+            [name: "Device Number", type: "NUMBER", description: "Number of the device"],
+            [name: "Ventilator State", type: "ENUM", constraints: ["on", "off"]],
+            [name: "Fan Speed", type: "ENUM", constraints: ["low", "medium", "high", "auto"]]
+        ]
+        command "updateAllStatus"
+        command "deleteAllDevices"
+        command "initialize"
     }
-    preferences {
-        input name: "logEnable", type: "bool", title: "Enable debug logging", defaultValue: true
-        input name: "txtEnable", type: "bool", title: "Enable descriptionText logging", defaultValue: true
+}
+
+preferences {
+    input name: "ipAddress", type: "text", title: "IP Address", required: true
+    input name: "port", type: "number", title: "Port", required: true
+    input name: "sender", type: "text", title: "Sender", required: true, description: "예: 203동701호"
+}
+
+def initialize() {
+    state.pendingCommands = [:]
+    state.msgNoCounter = new Random().nextInt(999999) + 1
+    runIn(1, "checkCommandTimeouts")
+}
+
+def parse(String description) {
+    log.debug "Received: ${description}"
+    
+    def message = parseTcpMessage(description)
+    if (message) {
+        processMessage(message)
     }
 }
 
-void logsOff(){
-    log.warn "debug logging disabled..."
-    device.updateSetting("logEnable",[value:"false",type:"bool"])
+def checkCommandTimeouts() {
+    def now = new Date().time
+    def timeoutThreshold = 3 // 3초 timeout
+
+    state.pendingCommands.each { msgNo, command ->
+        if (now - command.time > timeoutThreshold * 1000) {
+            log.warn "Command timed out: ${command}"
+            updateDeviceStatus(command.devName, command.devNum, "timeout")
+            state.pendingCommands.remove(msgNo)
+        }
+    }
 }
 
-void updated(){
-    log.info "updated..."
-    log.warn "debug logging is: ${logEnable == true}"
-    log.warn "description logging is: ${txtEnable == true}"
-    if (logEnable) runIn(1800,logsOff)
-}
-
-void parse(String description) {
-    //your parser here...
-}
-
-//demo custom commands
-void childSwitchOn(){
-    def cd = fetchChild("Switch")
-    cd.parse([[name:"switch", value:"on", descriptionText:"${cd.displayName} was turned on"]])
-}
-
-void childSwitchOff(){
-    def cd = fetchChild("Switch")
-    cd.parse([[name:"switch", value:"off", descriptionText:"${cd.displayName} was turned off"]])
-}
-
-void childDimmerOn(){
-    def cd = fetchChild("Dimmer")
-    List<Map> evts = []
-    evts.add([name:"switch", value:"on", descriptionText:"${cd.displayName} was turned on"])
-    Integer cv = cd.currentValue("level").toInteger()
-    evts.add([name:"level", value:cv, descriptionText:"${cd.displayName} level was set to ${cv}%", unit: "%"])
-    cd.parse(evts)
-}
-
-void childDimmerOff(){
-    def cd = fetchChild("Dimmer")
-    cd.parse([[name:"switch", value:"off", descriptionText:"${cd.displayName} was turned off"]])
-}
-
-void childDimmerSetLevel(level){
-    def cd = fetchChild("Dimmer")
-    List<Map> evts = []
-    String cv = cd.currentValue("switch")
-    if (cv == "off") evts.add([name:"switch", value:"on", descriptionText:"${cd.displayName} was turned on"])
-    evts.add([name:"level", value:level, descriptionText:"${cd.displayName} level was set to ${level}%", unit: "%"])
-    cd.parse(evts)    
-}
-
-void setTemperature(value){
-    def cd = fetchChild("Temperature Sensor")
-    String unit = "°${location.temperatureScale}"
-    cd.parse([[name:"temperature", value:value, descriptionText:"${cd.displayName} temperature is ${value}${unit}", unit: unit]])
-}
-
-def fetchChild(String type){
-    String thisId = device.id
-    def cd = getChildDevice("${thisId}-${type}")
-    if (!cd) {
-        cd = addChildDevice("bestin", "Generic Component ${type}", "${thisId}-${type}", [name: "${device.displayName} ${type}", isComponent: true])
-        //set initial attribute values, with a real device you would not do this here...
-        List<Map> defaultValues = []
-        switch (type) {
-            case "Switch":
-                defaultValues.add([name:"switch", value:"off", descriptionText:"set initial switch value"])
+def updateDeviceStatus(String devName, BigDecimal devNum, String status) {
+    def childDevice = getChildDeviceByNameAndNumber(devName, devNum)
+    if (childDevice) {
+        switch(devName) {
+            case ['batchlight', 'livinglight', 'light01', 'light02', 'light03', 'light04']:
+                childDevice.parse([[name: "switch", value: status == "timeout" ? "unknown" : status]])
                 break
-            case "Dimmer":
-                defaultValues.add([name:"switch", value:"off", descriptionText:"set initial switch value"])
-                defaultValues.add([name:"level", value:50, descriptionText:"set initial level value", unit:"%"])
+            case 'temper':
+                childDevice.parse([[name: "thermostatMode", value: status == "timeout" ? "unknown" : status]])
                 break
-            case "Temperature Sensor" :
-                String unit = "°${location.temperatureScale}"
-                BigInteger value = (unit == "°F") ? 70.0 : 21.0
-                defaultValues.add([name:"temperature", value:value, descriptionText:"set initial temperature value", unit:unit])
-                break
-            default :
-                log.warn "unable to set initial values for type:${type}"
+            case 'ventil':
+                childDevice.parse([[name: "switch", value: status == "timeout" ? "unknown" : status]])
                 break
         }
-        cd.parse(defaultValues)
     }
-    return cd 
 }
 
-//child device methods
-void componentRefresh(cd){
-    if (logEnable) log.info "received refresh request from ${cd.displayName}"
+// 명령 구현
+def requestDeviceStatus(String devName, BigDecimal devNum) {
+    log.debug "requestDeviceStatus called for ${devName} (Number: ${devNum})"
+    def childDevice = fetchChild(devName, devNum, "Switch")
+    if (childDevice) {
+        def msgNo = getNextMsgNo()
+        def xml = bestinXMLDeviceGetStatusRequest(devName, devNum, msgNo, "GET_DEVICE_STATE")
+        bestinSendXMLRequest(devName, devNum, msgNo, xml)
+    }
 }
 
-void componentOn(cd){
-    if (logEnable) log.info "received on request from ${cd.displayName}"
-    getChildDevice(cd.deviceNetworkId).parse([[name:"switch", value:"on", descriptionText:"${cd.displayName} was turned on"]])
+def setLightState(String devName, BigDecimal devNum, String state) {
+    log.debug "setLightState called for ${devName} (Number: ${devNum}) with state: ${state}"
+    def childDevice = fetchChild(devName, devNum, "Switch")
+    if (childDevice) {
+        def msgNo = getNextMsgNo()
+        def xml = bestinXMLDeviceSetControlRequest(devName, devNum, msgNo, state, "SET_LIGHT_STATE")
+        bestinSendXMLRequest(devName, devNum, msgNo, xml)
+    }
 }
 
-void componentOff(cd){
-    if (logEnable) log.info "received off request from ${cd.displayName}"
-    getChildDevice(cd.deviceNetworkId).parse([[name:"switch", value:"off", descriptionText:"${cd.displayName} was turned off"]])
+def setTemperature(String devName, BigDecimal devNum, BigDecimal temperature) {
+    log.debug "setTemperature called for ${devName} (Number: ${devNum}) with temperature: ${temperature}"
+    def childDevice = fetchChild(devName, devNum, "Thermostat")
+    if (childDevice) {
+        def msgNo = getNextMsgNo()
+        def xml = bestinXMLDeviceSetControlRequest(devName, devNum, msgNo, temperature.toString(), "SET_TEMPERATURE")
+        bestinSendXMLRequest(devName, devNum, msgNo, xml)
+    }
 }
 
-void componentSetLevel(cd,level,transitionTime = null) {
-    if (logEnable) log.info "received setLevel(${level}, ${transitionTime}) request from ${cd.displayName}"
-    getChildDevice(cd.deviceNetworkId).parse([[name:"level", value:level, descriptionText:"${cd.displayName} level was set to ${level}%", unit: "%"]])
+def setThermostatMode(String devName, BigDecimal devNum, String mode) {
+    log.debug "setThermostatMode called for ${devName} (Number: ${devNum}) with mode: ${mode}"
+    def childDevice = fetchChild(devName, devNum, "Thermostat")
+    if (childDevice) {
+        def msgNo = getNextMsgNo()
+        def xml = bestinXMLDeviceSetControlRequest(devName, devNum, msgNo, mode, "SET_THERMOSTAT_MODE")
+        bestinSendXMLRequest(devName, devNum, msgNo, xml)
+    }
 }
 
-void componentStartLevelChange(cd, direction) {
-    if (logEnable) log.info "received startLevelChange(${direction}) request from ${cd.displayName}"
+def controlAirVentilator(String devName, BigDecimal devNum, String state, String fanSpeed) {
+    log.debug "controlAirVentilator called for ${devName} (Number: ${devNum}) with state: ${state}, fan speed: ${fanSpeed}"
+    def childDevice = fetchChild(devName, devNum, "Fan")
+    if (childDevice) {
+        def msgNo = getNextMsgNo()
+        def action = "${state},${fanSpeed}"
+        def xml = bestinXMLDeviceSetControlRequest(devName, devNum, msgNo, action, "CONTROL_AIR_VENTILATOR")
+        bestinSendXMLRequest(devName, devNum, msgNo, xml)
+    }
 }
 
-void componentStopLevelChange(cd) {
-    if (logEnable) log.info "received stopLevelChange request from ${cd.displayName}"
+def updateAllStatus() {
+    log.debug "updateAllStatus called for all child devices"
+    
+    def children = getChildDevices()
+    children.each { child ->
+        log.debug "Updating status for child device: ${child.deviceNetworkId}"
+        try {
+            def (devName, devNum) = child.name.split('-')
+            requestDeviceStatus(devName, devNum as BigDecimal)
+        } catch (Exception e) {
+            log.error "Error updating status for child device ${child.deviceNetworkId}: ${e.message}"
+        }
+    }
 }
 
+def deleteAllDevices() {
+    log.debug "deleteAllDevices called for all child devices"
+    
+    def children = getChildDevices()
+    children.each { child ->
+        log.debug "delete child device: ${child.deviceNetworkId}"
+        try {
+            deleteChildDevice(child.deviceNetworkId)
+        } catch (Exception e) {
+            log.error "Error deleting child device ${child.deviceNetworkId}: ${e.message}"
+        }
+    }
+}
 
-List<String> configure() {
-    log.warn "configure..."
-    runIn(1800,logsOff)
-    //your configuration commands here...
+private def fetchChild(String devName, BigDecimal devNum, String type) {
+    if (devNum == null) {
+        log.error "fetchChild called with null devNum for device: ${devName}"
+        return null
+    }
+
+    def childDeviceNetworkId = "${device.deviceNetworkId}-${devName}-${devNum}"
+    def childDevice = getChildDevice(childDeviceNetworkId)
+    
+    if (!childDevice) {
+        log.debug "Child device not found. Creating new child device: ${childDeviceNetworkId}"
+        switch(type) {
+            case "Switch":
+            case "Thermostat":
+            case "Fan":
+                childDevice = addChildDevice("hubitat", "Generic Component ${type}", childDeviceNetworkId, [name: "${devName}-${devNum}", isComponent: true])
+                break
+            default:
+                log.warn "Unknown device type: ${type}. Child device not created."
+                return null
+        }
+    }
+    
+    return childDevice
+}
+
+// Child Device Methods
+void componentRefresh(childDevice) {
+    log.debug "componentRefresh called with child device: ${childDevice}"
+    def (devName, devNum) = childDevice.name.split('-')
+    requestDeviceStatus(devName, devNum as BigDecimal)
+}
+
+void componentOn(childDevice) {
+    log.debug "componentOn called with child device: ${childDevice}"
+    def (devName, devNum) = childDevice.name.split('-')
+    setLightState(devName, devNum as BigDecimal, "on")
+}
+
+void componentOff(childDevice) {
+    log.debug "componentOff called with child device: ${childDevice}"
+    def (devName, devNum) = childDevice.name.split('-')
+    setLightState(devName, devNum as BigDecimal, "off")
+}
+
+void componentSetSpeed(childDevice, speed) {
+    log.debug "componentSetSpeed called with child device: ${childDevice}, speed: ${speed}"
+    def (devName, devNum) = childDevice.name.split('-')
+    controlAirVentilator(devName, devNum as BigDecimal, "on", speed)
+}
+
+void componentSetHeatingSetpoint(childDevice, temperature) {
+    log.debug "componentSetHeatingSetpoint called with child device: ${childDevice}, temperature: ${temperature}"
+    def (devName, devNum) = childDevice.name.split('-')
+    setTemperature(devName, devNum as BigDecimal, temperature)
+}
+
+// Helper method to get child device by name and number
+private getChildDeviceByNameAndNumber(String devName, BigDecimal devNum) {
+    def childDeviceNetworkId = "${device.deviceNetworkId}-${devName}-${devNum}"
+    return getChildDevice(childDeviceNetworkId)
+}
+
+private bestinXMLDeviceGetStatusRequest(String devName, BigDecimal devNum, Integer msgNo, String cmdId) {
+    def xml = """
+        <?xml version="1.0" encoding="utf-8"?>
+        <imap ver="1.0" address="10.3.7.1" sender="${settings.sender}">
+        <service type="request" name="msg_home_device_get_status">
+            <target name="hubitat" id="1" msg_no="${msgNo}" />
+            <model_id>${devName}</model_id>
+            <dev_num>${devNum}</dev_num>
+            <command_id>${cmdId}</command_id>
+        </service>
+        </imap>
+    """
+    return xml
+}
+
+private bestinXMLDeviceSetControlRequest(String devName, BigDecimal devNum, BigDecimal msgNo, String action, String cmdId) {
+    def xml = """
+        <?xml version="1.0" encoding="utf-8"?>
+        <imap ver="1.0" address="10.3.7.1" sender="${settings.sender}">
+        <service type="request" name="msg_home_device_set_control">
+            <target name="hubitat" id="1" msg_no="${msgNo}" />
+            <model_id>${devName}</model_id>
+            <dev_num>${devNum}</dev_num>
+            <action>${action}</action>
+            <command_id>${cmdId}</command_id>
+        </service>
+        </imap>
+    """
+    return xml
+}
+
+// msg_no 생성 메서드
+private getNextMsgNo() {
+    state.msgNoCounter = (state.msgNoCounter + 1) % 1000000 // 큰 수로 순환
+    return state.msgNoCounter
+}
+
+// XML 요청 메서드
+private bestinSendXMLRequest(String devName, BigDecimal devNum, BigDecimal msgNo, String xml) {
+    log.debug "bestinSendXMLRequest called with child device: ${devName}-${devNum}"
+    state.pendingCommands[msgNo.toString()] = [devName: devName, devNum: devNum, time: new Date().time]
+    sendTcpMessage(xml)
+}
+
+private bestinHandleReply(xml) {
+    def result = xml.service.@result.text()
+    def msgNo = xml.service.target.@msg_no.toString()
+
+    log.debug "bestinHandleReply result ${result}, msg_no ${msgNo}"
+    log.debug "bestinHandleReply ${state.pendingCommands}"
+    
+    if (state.pendingCommands.containsKey(msgNo)) {
+        def command = state.pendingCommands[msgNo]
+        log.debug "Received reply for command: ${command}, result: ${result}"
+
+        if (result == "ok") {
+            def deviceType = xml.service.model_id.text()
+            def devNum = xml.service.dev_num.text()
+            def status = xml.service.status.text()
+            
+            log.debug "bestinHandleReply Reply deviceType ${deviceType}, devNum ${devNum}, status ${status}"
+            updateDeviceStatus(deviceType, new BigDecimal(devNum), status)
+        }
+
+        // 처리 완료된 명령 제거
+        state.pendingCommands.remove(msgNo)
+    } else {
+        log.warn "Received reply for unknown msg_no: ${msgNo}"
+    }
+}
+
+private sendTcpMessage(String message) {
+    def hubAction = new HubAction(
+        message,
+        Protocol.LAN,
+        [
+            type: HubAction.Type.LAN_TYPE_RAW,
+            destinationAddress: "${settings.ipAddress}:${settings.port}"
+        ]
+    )
+    sendHubCommand(hubAction)
+}
+
+private parseTcpMessage(String description) {
+    // HEX_STRING에서 실제 hex 값 추출
+    def hexString = description.split("payload:")[1].trim()
+
+    // Base64를 바이트 배열로 변환
+    byte[] bytes = hexString.decodeBase64()
+    
+    // 바이트 배열을 문자열로 변환
+    String decodedString = new String(bytes, "UTF-8")
+    
+    return decodedString
+}
+
+private processMessage(String message) {
+    // 여기서 받은 메시지를 처리합니다.
+    // 예: 상태 업데이트, 명령 응답 처리 등
+    log.debug "Processing message: ${message}"
+
+    // 메시지 내용에 따라 적절한 처리 로직 구현
+    def cleanedXml = message.trim() // 앞뒤 공백 제거
+    
+    // BOM 제거 (UTF-8 BOM인 경우)
+    if (cleanedXml.startsWith("\uFEFF")) {
+        cleanedXml = cleanedXml.substring(1)
+    }
+    
+    // XML 선언이 없는 경우 추가
+    if (!cleanedXml.startsWith("<?xml")) {
+        cleanedXml = "<?xml version='1.0' encoding='UTF-8'?>\n" + cleanedXml
+    }
+    
+    try {
+        def xmlSlurper = new XmlSlurper()
+        def xml = xmlSlurper.parseText(cleanedXml)
+        log.debug "XML 내용: ${cleanedXml}"
+        if (xml.service.@type == "reply") {
+            bestinHandleReply(xml)
+        }
+    } catch (org.xml.sax.SAXParseException e) {
+        log.error "XML 파싱 오류: ${e.message}"
+        log.debug "문제의 XML 내용: ${cleanedXml}"
+    }
 }
