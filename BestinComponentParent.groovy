@@ -1,6 +1,8 @@
 import hubitat.device.HubAction
 import hubitat.device.Protocol
 import groovy.time.TimeCategory
+import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.concurrent.ConcurrentHashMap
 
 metadata {
     definition (name: "Hubitat Bestin", namespace: "bestin", author: "Luke Lee") {
@@ -41,9 +43,11 @@ preferences {
 
 def initialize() {
     unschedule()
-    state.pendingCommands = [:]
+    state.clear()
+    state.submitCommands = new ConcurrentLinkedQueue<Map>()
+    state.sendingCommands = new ConcurrentHashMap<String, Map>()
     state.msgNoCounter = new Random().nextInt(999999) + 1
-    schedule("*/1 * * ? * *", "checkCommandTimeouts")
+    schedule("*/1 * * ? * *", "bestinCheckCommandTimeouts")
 }
 
 def parse(String description) {
@@ -52,19 +56,6 @@ def parse(String description) {
     def message = parseTcpMessage(description)
     if (message) {
         processMessage(message)
-    }
-}
-
-def checkCommandTimeouts() {
-    def now = new Date().time
-    def timeoutThreshold = 10
-
-    state.pendingCommands.each { msgNo, command ->
-        if (now - command.time > timeoutThreshold * 1000) {
-            log.warn "Command timed out: ${command}"
-            updateDeviceStatus(command.devName, command.devNum, "timeout")
-            state.pendingCommands.remove(msgNo)
-        }
     }
 }
 
@@ -266,11 +257,61 @@ private getNextMsgNo() {
     return state.msgNoCounter
 }
 
+private bestinSubmitXMLRequest(String devName, BigDecimal devNum, BigDecimal msgNo, String xml) {
+    log.debug "bestinSubmitXMLRequest called with child device: ${devName}-${devNum}"
+    state.submitCommands.offer([msgNo: msgNo, devName: devName, devNum: devNum, xml: xml])
+    bestinProcessSubmitedXMLRequest()
+}
+
+private bestinProcessSubmitedXMLRequest() {
+    while (state.sendingCommands.size() <= 2) {
+        try {
+        def command = state.submitCommands.pop()
+            if (command) {
+                bestinSendXMLRequest(command.msgNo, command.devName, command.devNum, command.msgNo, command.xml)
+            }
+        } catch (NoSuchElementException e) {
+            break
+        }
+    }
+}
+
 // XML 요청 메서드
 private bestinSendXMLRequest(String devName, BigDecimal devNum, BigDecimal msgNo, String xml) {
     log.debug "bestinSendXMLRequest called with child device: ${devName}-${devNum}"
-    state.pendingCommands[msgNo.toString()] = [devName: devName, devNum: devNum, time: new Date().time]
+    state.sendingCommands.put(msgNo.toString(), [devName: devName, devNum: devNum, time: new Date().time])
     sendTcpMessage(xml)
+}
+
+def bestinCheckCommandTimeouts() {
+    def now = new Date().time
+    def timeoutThreshold = 30
+
+    // ERROR: groovy.lang.MissingMethodException: No signature of method
+    // boolean removedAny = state.sendingCommands.removeIf { msgNo, command -> 
+    //     if (now - command.time > timeoutThreshold * 1000) {
+    //         log.warn "Command timed out: ${command}"
+    //         updateDeviceStatus(command.devName, command.devNum, "timeout")
+    //         return true
+    //     }
+    //     return false
+    // }
+
+    def iterator = state.sendingCommands.entrySet().iterator()
+    while (iterator.hasNext()) {
+        def entry = iterator.next()
+        try {
+            if (now - entry.value.time > timeoutThreshold * 1000) {
+                log.warn "Command timed out: ${entry.value}"
+                updateDeviceStatus(entry.value.devName, entry.value.devNum, "timeout")
+                iterator.remove()
+            }
+        } catch (IllegalStateException e) {
+            log.warn "Command already removed: ${entry.key}"
+        }
+    }
+
+    bestinProcessSubmitedXMLRequest()
 }
 
 private bestinHandleReply(xml) {
@@ -278,10 +319,10 @@ private bestinHandleReply(xml) {
     def msgNo = xml.service.target.@msg_no.toString()
 
     log.debug "bestinHandleReply result ${result}, msg_no ${msgNo}"
-    log.debug "bestinHandleReply ${state.pendingCommands}"
+    log.debug "bestinHandleReply ${state.sendingCommands}"
     
-    if (state.pendingCommands.containsKey(msgNo)) {
-        def command = state.pendingCommands[msgNo]
+    def command = state.sendingCommands.remove(msgNo)
+    if (command) {
         log.debug "Received reply for command: ${command}, result: ${result}"
 
         if (result == "ok") {
@@ -289,15 +330,14 @@ private bestinHandleReply(xml) {
             def devNum = xml.service.dev_num.text()
             def status = xml.service.status.text()
             
-            log.debug "bestinHandleReply Reply deviceType ${deviceType}, devNum ${devNum}, status ${status}"
+            log.debug "bestinHandleReply Reply deviceType ${deviceType}, devNum ${devNum}, status ${status}, elapsed ${new Date().time - command.time}"
             updateDeviceStatus(deviceType, new BigDecimal(devNum), status)
         }
-
-        // 처리 완료된 명령 제거
-        state.pendingCommands.remove(msgNo)
     } else {
         log.warn "Received reply for unknown msg_no: ${msgNo}"
     }
+
+    bestinProcessSubmitedXMLRequest()
 }
 
 private sendTcpMessage(String message) {
