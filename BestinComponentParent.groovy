@@ -329,6 +329,112 @@ def bestinCheckCommandTimeouts() {
     bestinProcessSubmitedXMLRequest()
 }
 
+// <imap ver = "1.0" address = "10.3.7.1" sender = "203동 701호">
+//     <service type = "notice" name= "msg_home_devices_status_event">
+//         <devinfo name = "livinglight" value = "5">
+//             <status name="livinglight" dev_num="1">off</status>
+//             <status name="livinglight" dev_num="2">on</status>
+//             <status name="livinglight" dev_num="3">off</status>
+//             <status name="livinglight" dev_num="4">off</status>
+//             <status name="livinglight" dev_num="5">off</status>
+//         </devinfo>
+//         <devinfo name = "gas" value = "1">
+//             <status name="gas" dev_num="1">close</status>
+//         </devinfo>
+//         <devinfo name = "ventil" value = "1">
+//             <status name="ventil" dev_num="1">on/high</status>
+//         </devinfo>
+//         <devinfo name = "batchlight" value = "1">
+//             <status name="batchlight" dev_num="1">off</status>
+//         </devinfo>
+//         <devinfo name = "temper" value = "4">
+//             <status name="temper" dev_num="1">off/25.0/28.2</status>
+//             <status name="temper" dev_num="2">off/24.5/28.7</status>
+//             <status name="temper" dev_num="3">off/24.5/29.5</status>
+//             <status name="temper" dev_num="4">off/23.5/29.6</status>
+//         </devinfo>
+//         <devinfo name = "light" value = "4">
+//             <subdevinfo name="light01" value ="3" >
+//                 <status name="light01" dev_num="1">on</status>
+//                 <status name="light01" dev_num="2">off</status>
+//                 <status name="light01" dev_num="3">on</status>
+//             </subdevinfo>
+//             <subdevinfo name="light02" value ="2" >
+//                 <status name="light02" dev_num="1">off</status>
+//                 <status name="light02" dev_num="2">off</status>
+//             </subdevinfo>
+//             <subdevinfo name="light03" value ="2" >
+//                 <status name="light03" dev_num="1">off</status>
+//                 <status name="light03" dev_num="2">off</status>
+//             </subdevinfo>
+//             <subdevinfo name="light04" value ="2" >
+//                 <status name="light04" dev_num="1">off</status>
+//                 <status name="light04" dev_num="2">on</status>
+//             </subdevinfo>
+//         </devinfo>
+//         <devinfo name = "electric" value = "4">
+//             <subdevinfo name="electric01" value ="2" >
+//                 <status name="electric01" dev_num="1">unset/on</status>
+//                 <status name="electric01" dev_num="2">unset/on</status>
+//             </subdevinfo>
+//             <subdevinfo name="electric02" value ="2" >
+//                 <status name="electric02" dev_num="1">unset/on</status>
+//                 <status name="electric02" dev_num="2">unset/on</status>
+//             </subdevinfo>
+//             <subdevinfo name="electric03" value ="2" >
+//                 <status name="electric03" dev_num="1">unset/on</status>
+//                 <status name="electric03" dev_num="2">unset/on</status>
+//             </subdevinfo>
+//             <subdevinfo name="electric04" value ="2" >
+//                 <status name="electric04" dev_num="1">unset/on</status>
+//                 <status name="electric04" dev_num="2">unset/on</status>
+//             </subdevinfo>
+//         </devinfo>
+//     </service>
+// </imap>
+
+// <imap ver = "1.0" address = "10.3.7.1" sender = "203동701호">
+//    <service type = "notice" name= "msg_device_event">
+//       <model_id>light03</model_id>
+//       <dev_num>1</dev_num>
+//       <status>on</status>
+//    </service>
+// </imap>
+private bestinHandleNotice(xml) {
+    def service_name = xml.service.@name.text()
+
+    if (service_name == "msg_device_event") {
+        def devName = xml.service.model_id.text()
+        def devNum = xml.service.dev_num.text()
+        def status = xml.service.status.text()
+        
+        log.debug "bestinHandleNotice device notice devName ${devName}, devNum ${devNum}, status ${status}"
+        updateDeviceStatus(devName, new BigDecimal(devNum), status)
+    } else if (service_name == "msg_home_devices_status_event") {
+        def list = xml.'**'.findAll { it.name() == "status" } 
+        list.each {
+            xmlStatus ->
+            def devName = xmlStatus.@name.text()
+            def devNum = xmlStatus.@dev_num.text()
+            def status = xmlStatus.text()
+            
+            log.debug "bestinHandleNotice devices notice devName ${devName}, devNum ${devNum}, status ${status}"
+            updateDeviceStatus(devName, new BigDecimal(devNum), status)
+        }
+    } else {
+        log.warn "Received notice for unknown service name: '${service_name}'"
+    }
+}
+
+// <imap ver = "1.0" address = "10.3.7.1" sender = "203동701호">
+//    <service type = "reply" name= "msg_home_device_set_control" result = "ok">
+//        <target name="wallpad" id="1" msg_no="35047" />
+//        <model_id>light03</model_id>
+//        <dev_num>1</dev_num>
+//        <status>on</status>
+//        <command_id>SET_LIGHT_STATE</command_id>
+//    </service>
+// </imap>
 private bestinHandleReply(xml) {
     def result = xml.service.@result.text()
     def msgNo = xml.service.target.@msg_no.toString()
@@ -343,12 +449,12 @@ private bestinHandleReply(xml) {
         state.sendingCommandCount--//.decrementAndGet()
 
         if (result == "ok") {
-            def deviceType = xml.service.model_id.text()
+            def devName = xml.service.model_id.text()
             def devNum = xml.service.dev_num.text()
             def status = xml.service.status.text()
             
-            log.debug "bestinHandleReply Reply deviceType ${deviceType}, devNum ${devNum}, status ${status}, elapsed ${new Date().time - command.time}"
-            updateDeviceStatus(deviceType, new BigDecimal(devNum), status)
+            log.debug "bestinHandleReply Reply devName ${devName}, devNum ${devNum}, status ${status}, elapsed ${new Date().time - command.time}"
+            updateDeviceStatus(devName, new BigDecimal(devNum), status)
         }
     } else {
         log.warn "Received reply for unknown msg_no: ${msgNo}"
@@ -387,28 +493,37 @@ private processMessage(String message) {
     // 예: 상태 업데이트, 명령 응답 처리 등
     log.debug "Processing message: ${message}"
 
-    // 메시지 내용에 따라 적절한 처리 로직 구현
-    def cleanedXml = message.trim() // 앞뒤 공백 제거
-    
-    // BOM 제거 (UTF-8 BOM인 경우)
-    if (cleanedXml.startsWith("\uFEFF")) {
-        cleanedXml = cleanedXml.substring(1)
-    }
-    
-    // XML 선언이 없는 경우 추가
-    if (!cleanedXml.startsWith("<?xml")) {
-        cleanedXml = "<?xml version='1.0' encoding='UTF-8'?>\n" + cleanedXml
-    }
-    
-    try {
-        def xmlSlurper = new XmlSlurper()
-        def xml = xmlSlurper.parseText(cleanedXml)
-        log.debug "XML 내용: ${cleanedXml}"
-        if (xml.service.@type == "reply") {
-            bestinHandleReply(xml)
+    def rawXmlList = message.split("</imap>");
+    rawXmlList.each { rawXml ->
+        rawXml += "</imap>"
+        log.debug "XML in message: ${rawXml}"
+
+        // 메시지 내용에 따라 적절한 처리 로직 구현
+        def cleanedXml = rawXml.trim() // 앞뒤 공백 제거
+        
+        // BOM 제거 (UTF-8 BOM인 경우)
+        if (cleanedXml.startsWith("\uFEFF")) {
+            cleanedXml = cleanedXml.substring(1)
         }
-    } catch (org.xml.sax.SAXParseException e) {
-        log.error "XML 파싱 오류: ${e.message}"
-        log.debug "문제의 XML 내용: ${cleanedXml}"
+        
+        // XML 선언이 없는 경우 추가
+        if (!cleanedXml.startsWith("<?xml")) {
+            cleanedXml = "<?xml version='1.0' encoding='UTF-8'?>\n" + cleanedXml
+        }
+        
+        try {
+            def xmlSlurper = new XmlSlurper()
+            def xml = xmlSlurper.parseText(cleanedXml)
+            log.debug "XML 내용: ${cleanedXml}"
+            if (xml.service.@type == "notice") {
+                bestinHandleNotice(xml)
+            }
+            else if (xml.service.@type == "reply") {
+                bestinHandleReply(xml)
+            }
+        } catch (org.xml.sax.SAXParseException e) {
+            log.error "XML 파싱 오류: ${e.message}"
+            log.debug "문제의 XML 내용: ${cleanedXml}"
+        }
     }
 }
