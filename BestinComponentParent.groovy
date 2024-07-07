@@ -1,6 +1,7 @@
 import hubitat.device.HubAction
 import hubitat.device.Protocol
 import groovy.time.TimeCategory
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.ConcurrentHashMap
 
@@ -41,11 +42,22 @@ preferences {
     input name: "sender", type: "text", title: "Sender", required: true, description: "예: 203동701호"
 }
 
+def installed() {
+    log.debug "installed()"
+    initialize()
+}
+
+def updated() {
+   log.debug "updated()"
+   initialize()
+}
+
 def initialize() {
     unschedule()
     state.clear()
     state.submitCommands = new ConcurrentLinkedQueue<Map>()
     state.sendingCommands = new ConcurrentHashMap<String, Map>()
+    state.sendingCommandCount = new AtomicInteger(0)
     state.msgNoCounter = new Random().nextInt(999999) + 1
     schedule("*/1 * * ? * *", "bestinCheckCommandTimeouts")
 }
@@ -83,7 +95,7 @@ def requestDeviceStatus(String devName, BigDecimal devNum) {
     if (childDevice) {
         def msgNo = getNextMsgNo()
         def xml = bestinXMLDeviceGetStatusRequest(devName, devNum, msgNo, "GET_DEVICE_STATE")
-        bestinSendXMLRequest(devName, devNum, msgNo, xml)
+        bestinSubmitXMLRequest(devName, devNum, msgNo, xml)
     }
 }
 
@@ -93,7 +105,7 @@ def setLightState(String devName, BigDecimal devNum, String state) {
     if (childDevice) {
         def msgNo = getNextMsgNo()
         def xml = bestinXMLDeviceSetControlRequest(devName, devNum, msgNo, state, "SET_LIGHT_STATE")
-        bestinSendXMLRequest(devName, devNum, msgNo, xml)
+        bestinSubmitXMLRequest(devName, devNum, msgNo, xml)
     }
 }
 
@@ -103,7 +115,7 @@ def setTemperature(String devName, BigDecimal devNum, BigDecimal temperature) {
     if (childDevice) {
         def msgNo = getNextMsgNo()
         def xml = bestinXMLDeviceSetControlRequest(devName, devNum, msgNo, temperature.toString(), "SET_TEMPERATURE")
-        bestinSendXMLRequest(devName, devNum, msgNo, xml)
+        bestinSubmitXMLRequest(devName, devNum, msgNo, xml)
     }
 }
 
@@ -113,7 +125,7 @@ def setThermostatMode(String devName, BigDecimal devNum, String mode) {
     if (childDevice) {
         def msgNo = getNextMsgNo()
         def xml = bestinXMLDeviceSetControlRequest(devName, devNum, msgNo, mode, "SET_THERMOSTAT_MODE")
-        bestinSendXMLRequest(devName, devNum, msgNo, xml)
+        bestinSubmitXMLRequest(devName, devNum, msgNo, xml)
     }
 }
 
@@ -124,7 +136,7 @@ def controlAirVentilator(String devName, BigDecimal devNum, String state, String
         def msgNo = getNextMsgNo()
         def action = "${state},${fanSpeed}"
         def xml = bestinXMLDeviceSetControlRequest(devName, devNum, msgNo, action, "CONTROL_AIR_VENTILATOR")
-        bestinSendXMLRequest(devName, devNum, msgNo, xml)
+        bestinSubmitXMLRequest(devName, devNum, msgNo, xml)
     }
 }
 
@@ -258,19 +270,20 @@ private getNextMsgNo() {
 }
 
 private bestinSubmitXMLRequest(String devName, BigDecimal devNum, BigDecimal msgNo, String xml) {
-    log.debug "bestinSubmitXMLRequest called with child device: ${devName}-${devNum}"
-    state.submitCommands.offer([msgNo: msgNo, devName: devName, devNum: devNum, xml: xml])
+    log.debug "bestinSubmitXMLRequest called with child device: ${devName}-${devNum} msgNo:${msgNo}"
+    //state.submitCommands.offer([msgNo: msgNo, devName: devName, devNum: devNum, xml: xml])
+    state.submitCommands.add([msgNo: msgNo, devName: devName, devNum: devNum, xml: xml])
     bestinProcessSubmitedXMLRequest()
 }
 
 private bestinProcessSubmitedXMLRequest() {
-    while (state.sendingCommands.size() <= 2) {
+    while (state.sendingCommandCount < 1) {
         try {
-        def command = state.submitCommands.pop()
+        def command = state.submitCommands.remove(0)
             if (command) {
-                bestinSendXMLRequest(command.msgNo, command.devName, command.devNum, command.msgNo, command.xml)
+                bestinSendXMLRequest(command.devName, command.devNum, command.msgNo, command.xml)
             }
-        } catch (NoSuchElementException e) {
+        } catch (IndexOutOfBoundsException e) {
             break
         }
     }
@@ -280,6 +293,7 @@ private bestinProcessSubmitedXMLRequest() {
 private bestinSendXMLRequest(String devName, BigDecimal devNum, BigDecimal msgNo, String xml) {
     log.debug "bestinSendXMLRequest called with child device: ${devName}-${devNum}"
     state.sendingCommands.put(msgNo.toString(), [devName: devName, devNum: devNum, time: new Date().time])
+    state.sendingCommandCount++//.incrementAndGet()
     sendTcpMessage(xml)
 }
 
@@ -305,6 +319,7 @@ def bestinCheckCommandTimeouts() {
                 log.warn "Command timed out: ${entry.value}"
                 updateDeviceStatus(entry.value.devName, entry.value.devNum, "timeout")
                 iterator.remove()
+                state.sendingCommandCount--//.decrementAndGet()
             }
         } catch (IllegalStateException e) {
             log.warn "Command already removed: ${entry.key}"
@@ -324,6 +339,8 @@ private bestinHandleReply(xml) {
     def command = state.sendingCommands.remove(msgNo)
     if (command) {
         log.debug "Received reply for command: ${command}, result: ${result}"
+        
+        state.sendingCommandCount--//.decrementAndGet()
 
         if (result == "ok") {
             def deviceType = xml.service.model_id.text()
