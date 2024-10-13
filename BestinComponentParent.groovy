@@ -27,8 +27,7 @@ metadata {
         command "controlAirVentilator", [
             [name: "Device Name", type: "ENUM", constraints: ['ventil']],
             [name: "Device Number", type: "NUMBER", description: "Number of the device"],
-            [name: "Ventilator State", type: "ENUM", constraints: ["on", "off"]],
-            [name: "Fan Speed", type: "ENUM", constraints: ["low", "medium", "high", "auto"]]
+            [name: "Fan Speed", type: "ENUM", constraints: ["off", "low", "medium", "high"]]
         ]
         command "updateAllStatus"
         command "deleteAllDevices"
@@ -76,6 +75,10 @@ def initialize() {
     fetchChild('light04', 1, "Switch")
     fetchChild('light04', 2, "Switch")
     fetchChild('batchlight', 1, "Switch")
+    
+    def fanChild = fetchChild('ventil', 1, "Fan Control")
+    // fanChild.sendEvent([name: "supportedFanSpeeds", value: ["low", "medium", "high", "off"]])
+    state.lastFanSpeed = "low"
 }
 
 def parse(String description) {
@@ -95,6 +98,32 @@ def parse(String description) {
     }
 }
 
+private def FanSpeedToAction(String speed) {
+    if (speed.trim() == "off")
+        return "off"
+    else if (speed.trim() == "low")
+        return "on/low"
+    else if (speed.trim() == "medium" || speed.trim() == "medium-low" || speed.trim() == "medium-high")
+        return "on/mid"
+    else if (speed.trim() == "high")
+        return "on/high"
+    
+    return "unknown(${speed})"
+}
+
+private def FanActionToSpeed(String action) {
+    if (action.trim() == "off")
+        return "off"
+    else if (action.trim() == "on/low")
+        return "low"
+    else if (action.trim() == "on/mid")
+        return "medium"
+    else if (action.trim() == "on/high")
+        return "high"
+    
+    return "unknown(${action})"
+}
+
 def updateDeviceStatus(String devName, BigDecimal devNum, String status) {
     def childDevice = getChildDeviceByNameAndNumber(devName, devNum)
     if (childDevice) {
@@ -106,7 +135,9 @@ def updateDeviceStatus(String devName, BigDecimal devNum, String status) {
                 childDevice.parse([[name: "thermostatMode", value: status == "timeout" ? "unknown" : status]])
                 break
             case 'ventil':
-                childDevice.parse([[name: "switch", value: status == "timeout" ? "unknown" : status]])
+                if (status != "off")
+                    state.lastFanSpeed = FanActionToSpeed(status)
+                childDevice.parse([[name: "speed", value: status == "timeout" ? "unknown" : FanActionToSpeed(status)]])
                 break
         }
     }
@@ -153,13 +184,18 @@ def setThermostatMode(String devName, BigDecimal devNum, String mode) {
     }
 }
 
-def controlAirVentilator(String devName, BigDecimal devNum, String state, String fanSpeed) {
-    log.info "controlAirVentilator called for ${devName} (Number: ${devNum}) with state: ${state}, fan speed: ${fanSpeed}"
-    def childDevice = fetchChild(devName, devNum, "Fan")
+def controlAirVentilator(String devName, BigDecimal devNum, String fanSpeed) {
+    log.info "controlAirVentilator called for ${devName} (Number: ${devNum}) with fan speed: ${fanSpeed}, last: ${state.lastFanSpeed}"
+    def childDevice = fetchChild(devName, devNum, "Fan Control")
     if (childDevice) {
+        if (fanSpeed == "on")
+            fanSpeed = state.lastFanSpeed
+        else if (fanSpeed != "off")
+            state.lastFanSpeed = fanSpeed
+
         def msgNo = getNextMsgNo()
-        def action = "${state},${fanSpeed}"
-        def xml = bestinXMLDeviceSetControlRequest(devName, devNum, msgNo, action, "CONTROL_AIR_VENTILATOR")
+        def xml = bestinXMLDeviceSetControlRequest(devName, devNum, msgNo, FanSpeedToAction(fanSpeed), "CONTROL_AIR_VENTILATOR")
+        // log.info xml.encodeAsBase64()
         bestinSubmitXMLRequest(devName, devNum, msgNo, xml)
     }
 }
@@ -207,7 +243,7 @@ private def fetchChild(String devName, BigDecimal devNum, String type) {
         switch(type) {
             case "Switch":
             case "Thermostat":
-            case "Fan":
+            case "Fan Control":
                 childDevice = addChildDevice("hubitat", "Generic Component ${type}", childDeviceNetworkId,
                                              [ name: "${devName}-${devNum}", isComponent: true ]
                                             )
@@ -243,7 +279,7 @@ void componentOff(childDevice) {
 void componentSetSpeed(childDevice, speed) {
     log.debug "componentSetSpeed called with child device: ${childDevice}, speed: ${speed}"
     def (devName, devNum) = childDevice.name.split('-')
-    controlAirVentilator(devName, devNum as BigDecimal, "on", speed)
+    controlAirVentilator(devName, devNum as BigDecimal, speed)
 }
 
 void componentSetHeatingSetpoint(childDevice, temperature) {
