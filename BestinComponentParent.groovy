@@ -55,17 +55,41 @@ def updated() {
 def initialize() {
     unschedule()
     state.clear()
-    state.submitCommands = new ConcurrentLinkedQueue<Map>()
+    atomicState.clear()
+    state.submitedCommands = new ConcurrentLinkedQueue<Map>()
     state.sendingCommands = new ConcurrentHashMap<String, Map>()
     state.sendingCommandCount = new AtomicInteger(0)
-    state.msgNoCounter = new Random().nextInt(999999) + 1
+    state.latestSendTime = new AtomicInteger(0)
+    state.msgNoCounter = new AtomicInteger(new Random().nextInt(999999) + 1)
     schedule("*/1 * * ? * *", "bestinCheckCommandTimeouts")
+    
+    fetchChild('livinglight', 1, "Switch")
+    fetchChild('livinglight', 2, "Switch")
+    fetchChild('livinglight', 3, "Switch")
+    fetchChild('light01', 1, "Switch")
+    fetchChild('light01', 2, "Switch")
+    fetchChild('light01', 3, "Switch")
+    fetchChild('light02', 1, "Switch")
+    fetchChild('light02', 2, "Switch")
+    fetchChild('light03', 1, "Switch")
+    fetchChild('light03', 2, "Switch")
+    fetchChild('light04', 1, "Switch")
+    fetchChild('light04', 2, "Switch")
+    fetchChild('batchlight', 1, "Switch")
 }
 
 def parse(String description) {
+    def message = null
     log.debug "Received: ${description}"
     
-    def message = parseTcpMessage(description)
+    if (description.contains("type:LAN_TYPE_RAW")) {
+        message = parseTcpMessage(description)
+    } else if (description.contains("headers:") && description.contains("body:")) {
+        message = parseHttpMessage(description)
+    } else {
+        log.warn "Received unhandled data: ${description}"
+    }
+
     if (message) {
         processMessage(message)
     }
@@ -90,7 +114,7 @@ def updateDeviceStatus(String devName, BigDecimal devNum, String status) {
 
 // 명령 구현
 def requestDeviceStatus(String devName, BigDecimal devNum) {
-    log.debug "requestDeviceStatus called for ${devName} (Number: ${devNum})"
+    log.info "requestDeviceStatus called for ${devName} (Number: ${devNum})"
     def childDevice = fetchChild(devName, devNum, "Switch")
     if (childDevice) {
         def msgNo = getNextMsgNo()
@@ -100,7 +124,7 @@ def requestDeviceStatus(String devName, BigDecimal devNum) {
 }
 
 def setLightState(String devName, BigDecimal devNum, String state) {
-    log.debug "setLightState called for ${devName} (Number: ${devNum}) with state: ${state}"
+    log.info "setLightState called for ${devName} (Number: ${devNum}) with state: ${state}"
     def childDevice = fetchChild(devName, devNum, "Switch")
     if (childDevice) {
         def msgNo = getNextMsgNo()
@@ -110,7 +134,7 @@ def setLightState(String devName, BigDecimal devNum, String state) {
 }
 
 def setTemperature(String devName, BigDecimal devNum, BigDecimal temperature) {
-    log.debug "setTemperature called for ${devName} (Number: ${devNum}) with temperature: ${temperature}"
+    log.info "setTemperature called for ${devName} (Number: ${devNum}) with temperature: ${temperature}"
     def childDevice = fetchChild(devName, devNum, "Thermostat")
     if (childDevice) {
         def msgNo = getNextMsgNo()
@@ -120,7 +144,7 @@ def setTemperature(String devName, BigDecimal devNum, BigDecimal temperature) {
 }
 
 def setThermostatMode(String devName, BigDecimal devNum, String mode) {
-    log.debug "setThermostatMode called for ${devName} (Number: ${devNum}) with mode: ${mode}"
+    log.info "setThermostatMode called for ${devName} (Number: ${devNum}) with mode: ${mode}"
     def childDevice = fetchChild(devName, devNum, "Thermostat")
     if (childDevice) {
         def msgNo = getNextMsgNo()
@@ -130,7 +154,7 @@ def setThermostatMode(String devName, BigDecimal devNum, String mode) {
 }
 
 def controlAirVentilator(String devName, BigDecimal devNum, String state, String fanSpeed) {
-    log.debug "controlAirVentilator called for ${devName} (Number: ${devNum}) with state: ${state}, fan speed: ${fanSpeed}"
+    log.info "controlAirVentilator called for ${devName} (Number: ${devNum}) with state: ${state}, fan speed: ${fanSpeed}"
     def childDevice = fetchChild(devName, devNum, "Fan")
     if (childDevice) {
         def msgNo = getNextMsgNo()
@@ -184,7 +208,9 @@ private def fetchChild(String devName, BigDecimal devNum, String type) {
             case "Switch":
             case "Thermostat":
             case "Fan":
-                childDevice = addChildDevice("hubitat", "Generic Component ${type}", childDeviceNetworkId, [name: "${devName}-${devNum}", isComponent: true])
+                childDevice = addChildDevice("hubitat", "Generic Component ${type}", childDeviceNetworkId,
+                                             [ name: "${devName}-${devNum}", isComponent: true ]
+                                            )
                 break
             default:
                 log.warn "Unknown device type: ${type}. Child device not created."
@@ -271,15 +297,15 @@ private getNextMsgNo() {
 
 private bestinSubmitXMLRequest(String devName, BigDecimal devNum, BigDecimal msgNo, String xml) {
     log.debug "bestinSubmitXMLRequest called with child device: ${devName}-${devNum} msgNo:${msgNo}"
-    //state.submitCommands.offer([msgNo: msgNo, devName: devName, devNum: devNum, xml: xml])
-    state.submitCommands.add([msgNo: msgNo, devName: devName, devNum: devNum, xml: xml])
+    //state.submitedCommands.offer([msgNo: msgNo, devName: devName, devNum: devNum, xml: xml])
+    state.submitedCommands.add([msgNo: msgNo, devName: devName, devNum: devNum, xml: xml])
     bestinProcessSubmitedXMLRequest()
 }
 
 private bestinProcessSubmitedXMLRequest() {
     while (state.sendingCommandCount < 1) {
         try {
-        def command = state.submitCommands.remove(0)
+        def command = state.submitedCommands.remove(0)
             if (command) {
                 bestinSendXMLRequest(command.devName, command.devNum, command.msgNo, command.xml)
             }
@@ -299,7 +325,7 @@ private bestinSendXMLRequest(String devName, BigDecimal devNum, BigDecimal msgNo
 
 def bestinCheckCommandTimeouts() {
     def now = new Date().time
-    def timeoutThreshold = 30
+    def timeoutThreshold = 5
 
     // ERROR: groovy.lang.MissingMethodException: No signature of method
     // boolean removedAny = state.sendingCommands.removeIf { msgNo, command -> 
@@ -327,6 +353,8 @@ def bestinCheckCommandTimeouts() {
     }
 
     bestinProcessSubmitedXMLRequest()
+    // if (new Date().getTime() - state.latestSendTime > 5000)
+    //     sendTcpMessage("Poll")
 }
 
 // <imap ver = "1.0" address = "10.3.7.1" sender = "203동 701호">
@@ -408,7 +436,7 @@ private bestinHandleNotice(xml) {
         def devNum = xml.service.dev_num.text()
         def status = xml.service.status.text()
         
-        log.debug "bestinHandleNotice device notice devName ${devName}, devNum ${devNum}, status ${status}"
+        log.info "bestinHandleNotice device notice devName ${devName}, devNum ${devNum}, status ${status}"
         updateDeviceStatus(devName, new BigDecimal(devNum), status)
     } else if (service_name == "msg_home_devices_status_event") {
         def list = xml.'**'.findAll { it.name() == "status" } 
@@ -418,7 +446,7 @@ private bestinHandleNotice(xml) {
             def devNum = xmlStatus.@dev_num.text()
             def status = xmlStatus.text()
             
-            log.debug "bestinHandleNotice devices notice devName ${devName}, devNum ${devNum}, status ${status}"
+            log.info "bestinHandleNotice devices notice devName ${devName}, devNum ${devNum}, status ${status}"
             updateDeviceStatus(devName, new BigDecimal(devNum), status)
         }
     } else {
@@ -453,8 +481,10 @@ private bestinHandleReply(xml) {
             def devNum = xml.service.dev_num.text()
             def status = xml.service.status.text()
             
-            log.debug "bestinHandleReply Reply devName ${devName}, devNum ${devNum}, status ${status}, elapsed ${new Date().time - command.time}"
+            log.info "bestinHandleReply Reply devName ${devName}, devNum ${devNum}, status ${status}, elapsed ${new Date().time - command.time}"
             updateDeviceStatus(devName, new BigDecimal(devNum), status)
+        } else {
+            log.warn "Received reply for result fail: ${result}"
         }
     } else {
         log.warn "Received reply for unknown msg_no: ${msgNo}"
@@ -473,17 +503,39 @@ private sendTcpMessage(String message) {
         ]
     )
     sendHubCommand(hubAction)
+    state.latestSendTime = new Date().getTime()
 }
 
-private parseTcpMessage(String description) {
+private parseHttpMessage(String description) {
     // HEX_STRING에서 실제 hex 값 추출
-    def hexString = description.split("payload:")[1].trim()
+    def descs = description.split("body:")
+    if (descs.size() < 2)
+        return null
+
+    def hexString = descs[1]
 
     // Base64를 바이트 배열로 변환
     byte[] bytes = hexString.decodeBase64()
     
     // 바이트 배열을 문자열로 변환
-    String decodedString = new String(bytes, "UTF-8")
+    String decodedString = new String(bytes, "UTF-8").trim()
+    
+    return decodedString
+}
+
+private parseTcpMessage(String description) {
+    // HEX_STRING에서 실제 hex 값 추출
+    def descs = description.split("payload:")
+    if (descs.size() < 2)
+        return null
+
+    def hexString = descs[1]
+
+    // Base64를 바이트 배열로 변환
+    byte[] bytes = hexString.decodeBase64()
+    
+    // 바이트 배열을 문자열로 변환
+    String decodedString = new String(bytes, "UTF-8").trim()
     
     return decodedString
 }
