@@ -258,7 +258,12 @@ private static List<String> observedProps(String kind, String propName) {
 // ---------------------------------------------------------------------------
 
 def connectWebSocket() {
+    unschedule("connectWebSocket")
+    state.connecting = true
     state.connected = false
+    // Closing a live socket fires webSocketStatus("status: closing"); the connecting
+    // flag stops that self-initiated close from scheduling another reconnect (which
+    // would tear the fresh connection down 1s later, looping forever).
     try {
         interfaces.webSocket.close()
     } catch (Exception ignored) { }
@@ -275,12 +280,19 @@ def connectWebSocket() {
 def webSocketStatus(String message) {
     logDebug "webSocketStatus: ${message}"
     if (message.startsWith("status: open")) {
+        unschedule("connectWebSocket")
+        state.connecting = false
         state.connected = true
         state.reconnectDelay = 1
         sendEvent(name: "connection", value: "connected")
         log.info "WebSocket connected to ${settings.ipAddress}:${settings.port}"
         observeAll()
     } else if (message.startsWith("status: closing") || message.startsWith("failure:")) {
+        if (state.connecting && message.startsWith("status: closing")) {
+            logDebug "Ignoring self-initiated close during connect"
+            return
+        }
+        state.connecting = false
         if (state.connected) log.warn "WebSocket disconnected: ${message}"
         state.connected = false
         sendEvent(name: "connection", value: "disconnected")
