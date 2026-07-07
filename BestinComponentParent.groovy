@@ -1,14 +1,32 @@
-import hubitat.device.HubAction
-import hubitat.device.Protocol
-import groovy.time.TimeCategory
-import java.util.concurrent.atomic.AtomicInteger
-import java.util.concurrent.ConcurrentLinkedQueue
-import java.util.concurrent.ConcurrentHashMap
+import groovy.json.JsonOutput
+import groovy.json.JsonSlurper
+import groovy.transform.Field
+
+/**
+ * Hubitat Bestin — parent driver for the besthing WoT servient.
+ *
+ * Structure is discovered dynamically from the servient's Thing Description catalog
+ * (GET http://<ip>:<port>/things): initialize() walks every Thing and maps affordances to
+ * Hubitat component children through the rule tables below (THING_KIND_RULES + propKind()).
+ * All interaction then runs over one WebSocket speaking the W3C Web Thing Protocol
+ * (request/response/notification JSON envelopes; observations re-register per connection).
+ *
+ * What stays in code (the TD cannot express it):
+ *  - semantic rules: which TD shapes become which Hubitat drivers, and value conversions
+ *    (ventil mid<->medium, thermostat pause->off, motion detect->active, ...)
+ *  - LEGACY_ALIASES: (thing|affordance) -> child names from the imap-XML era, so devices
+ *    that predate this driver keep their DNIs, rules and dashboards.
+ *
+ * Children created by discovery carry data values (thingId/kind/propName) that drive
+ * observe registration, incoming routing and component commands — names are never parsed.
+ * New affordances only get children when the createNewDevices preference is on.
+ */
 
 metadata {
     definition (name: "Hubitat Bestin", namespace: "bestin", author: "Luke Lee") {
         capability "Configuration"
-        
+        capability "Initialize"
+
         command "setLightState", [
             [name: "Device Name", type: "ENUM", constraints: ['batchlight', 'livinglight', 'light01', 'light02', 'light03', 'light04']],
             [name: "Device Number", type: "NUMBER", description: "Number of the device"],
@@ -22,7 +40,7 @@ metadata {
         command "setThermostatMode", [
             [name: "Device Name", type: "ENUM", constraints: ['temper']],
             [name: "Device Number", type: "NUMBER", description: "Number of the device"],
-            [name: "Thermostat Mode", type: "ENUM", constraints: ["heat", "cool", "auto", "off"]]
+            [name: "Thermostat Mode", type: "ENUM", constraints: ["heat", "off"]]
         ]
         command "controlAirVentilator", [
             [name: "Device Name", type: "ENUM", constraints: ['ventil']],
@@ -32,195 +50,464 @@ metadata {
         command "updateAllStatus"
         command "deleteAllDevices"
         command "initialize"
+
+        attribute "connection", "enum", ["connected", "disconnected"]
     }
 }
 
 preferences {
     input name: "ipAddress", type: "text", title: "IP Address", required: true
-    input name: "port", type: "number", title: "Port", required: true
-    input name: "sender", type: "text", title: "Sender", required: true, description: "예: 203동701호"
+    input name: "port", type: "number", title: "Port", required: true, defaultValue: 8788
+    input name: "createNewDevices", type: "bool", title: "Create child devices for newly discovered affordances", defaultValue: false
+    input name: "logEnable", type: "bool", title: "Enable debug logging", defaultValue: true
 }
 
+// ---------------------------------------------------------------------------
+// Rule tables
+// ---------------------------------------------------------------------------
+
+// Things modeled as ONE child for the whole Thing (its properties are facets of one device).
+@Field static final Map THING_KIND_RULES = [
+    'wallpad:Thermostat' : [kind: 'thermostat', driver: 'Generic Component Thermostat'],
+    'wallpad:Ventilation': [kind: 'fan',        driver: 'Generic Component Fan Control'],
+    'wallpad:GasValve'   : [kind: 'valve',      driver: 'Generic Component Valve'],
+]
+
+@Field static final Map DRIVER_FOR_KIND = [
+    'switch'      : 'Generic Component Switch',
+    'actionSwitch': 'Generic Component Switch',
+    'power'       : 'Generic Component Power Meter',
+    'motion'      : 'Generic Component Motion Sensor',
+    'contact'     : 'Generic Component Contact Sensor',
+]
+
+// (thingID|property) or (thingID|__thing__) -> child name from the imap-XML era.
+// Guarantees pre-migration children keep their DNI `<parentDNI>-<name>`.
+@Field static final Map LEGACY_ALIASES = [
+    'urn:besthing:light:living|switch1': 'livinglight-1',
+    'urn:besthing:light:living|switch2': 'livinglight-2',
+    'urn:besthing:light:living|switch3': 'livinglight-3',
+    'urn:besthing:light:living|switch4': 'livinglight-4',
+    'urn:besthing:light:living|switch5': 'livinglight-5',
+    'urn:besthing:light:room1|switch1' : 'light01-1',
+    'urn:besthing:light:room1|switch2' : 'light01-2',
+    'urn:besthing:light:room1|switch3' : 'light01-3',
+    'urn:besthing:light:room2|switch1' : 'light02-1',
+    'urn:besthing:light:room2|switch2' : 'light02-2',
+    'urn:besthing:light:room3|switch1' : 'light03-1',
+    'urn:besthing:light:room3|switch2' : 'light03-2',
+    'urn:besthing:light:room4|switch1' : 'light04-1',
+    'urn:besthing:light:room4|switch2' : 'light04-2',
+    'urn:besthing:light|all_lights'    : 'batchlight-1',
+    'urn:besthing:ventil|__thing__'    : 'ventil-1',
+    'urn:besthing:thermostat:room1|__thing__': 'temper-1',
+    'urn:besthing:thermostat:room2|__thing__': 'temper-2',
+    'urn:besthing:thermostat:room3|__thing__': 'temper-3',
+    'urn:besthing:thermostat:room4|__thing__': 'temper-4',
+]
+
+@Field static final int RECONNECT_MAX_SEC = 60
+
 def installed() {
-    log.debug "installed()"
+    logDebug "installed()"
     initialize()
 }
 
 def updated() {
-   log.debug "updated()"
-   initialize()
+    logDebug "updated()"
+    initialize()
+}
+
+def configure() {
+    initialize()
 }
 
 def initialize() {
     unschedule()
-    state.clear()
-    atomicState.clear()
-    state.submitedCommands = new ConcurrentLinkedQueue<Map>()
-    state.sendingCommands = new ConcurrentHashMap<String, Map>()
-    state.sendingCommandCount = new AtomicInteger(0)
-    state.latestSendTime = new AtomicInteger(0)
-    state.msgNoCounter = new AtomicInteger(new Random().nextInt(999999) + 1)
-    schedule("*/1 * * ? * *", "bestinCheckCommandTimeouts")
-    
-    fetchChild('livinglight', 1, "Switch")
-    fetchChild('livinglight', 2, "Switch")
-    fetchChild('livinglight', 3, "Switch")
-    fetchChild('light01', 1, "Switch")
-    fetchChild('light01', 2, "Switch")
-    fetchChild('light01', 3, "Switch")
-    fetchChild('light02', 1, "Switch")
-    fetchChild('light02', 2, "Switch")
-    fetchChild('light03', 1, "Switch")
-    fetchChild('light03', 2, "Switch")
-    fetchChild('light04', 1, "Switch")
-    fetchChild('light04', 2, "Switch")
-    fetchChild('batchlight', 1, "Switch")
-    
-    def fanChild = fetchChild('ventil', 1, "Fan Control")
-    // fanChild.sendEvent([name: "supportedFanSpeeds", value: ["low", "medium", "high", "off"]])
-    state.lastFanSpeed = "low"
+    // Drop leftover state from the imap-XML protocol version.
+    ['submitedCommands', 'sendingCommands', 'sendingCommandCount', 'latestSendTime', 'msgNoCounter'].each { state.remove(it) }
+    state.reconnectDelay = 1
+    if (!state.lastFanSpeed) state.lastFanSpeed = "low"
+
+    runDiscovery()
+    connectWebSocket()
+}
+
+// ---------------------------------------------------------------------------
+// TD discovery
+// ---------------------------------------------------------------------------
+
+private void runDiscovery() {
+    def tds = fetchTdCatalog()
+    if (tds == null) {
+        log.warn "TD discovery failed; keeping existing children as-is"
+        return
+    }
+    tds.each { td -> discoverThing(td) }
+}
+
+private List fetchTdCatalog() {
+    def result = null
+    def uri = "http://${settings.ipAddress}:${settings.port as int}/things"
+    try {
+        httpGet([uri: uri, contentType: 'application/json', timeout: 10]) { resp ->
+            result = resp.data
+        }
+        logDebug "TD catalog fetched: ${result?.size()} things"
+    } catch (Exception e) {
+        log.error "TD fetch from ${uri} failed: ${e.message}"
+    }
+    return result
+}
+
+private void discoverThing(Map td) {
+    String thingId = td.id
+    def thingRule = THING_KIND_RULES[td['@type'] as String]
+    if (thingRule) {
+        ensureChildFor(thingId, null, thingRule.kind, thingRule.driver, td.title as String)
+        return
+    }
+
+    td.properties?.each { propName, spec ->
+        def kind = propKind(propName as String, spec as Map)
+        if (kind) ensureChildFor(thingId, propName as String, kind, DRIVER_FOR_KIND[kind], "${td.title} ${propName}")
+        else logDebug "No rule for property ${thingId}/${propName}"
+    }
+
+    // Stateless on/off actions (e.g. all_lights) become switches; sensitive ones never auto-map.
+    td.actions?.each { actName, spec ->
+        if (spec['wallpad:sensitive']) return
+        if ((spec.input?.enum as Set) == (['on', 'off'] as Set)) {
+            ensureChildFor(thingId, actName as String, 'actionSwitch', DRIVER_FOR_KIND.actionSwitch, "${td.title} ${actName}")
+        } else {
+            logDebug "No rule for action ${thingId}/${actName}"
+        }
+    }
+}
+
+// Property-level semantic rules: TD schema shape -> Hubitat child kind.
+private static String propKind(String propName, Map spec) {
+    boolean writable = !spec.readOnly
+    if (writable && (spec.enum as Set) == (['on', 'off'] as Set)) return 'switch'
+    if ((spec.enum as Set) == (['detect', 'normal'] as Set)) return propName == 'motion' ? 'motion' : 'contact'
+    if (spec.readOnly && spec.unit == 'W') return 'power'
+    return null
+}
+
+private void ensureChildFor(String thingId, String prop, String kind, String driver, String label) {
+    def name = childNameFor(thingId, prop, kind)
+    def dni = "${device.deviceNetworkId}-${name}"
+    def child = getChildDevice(dni)
+    if (!child) {
+        boolean isLegacy = LEGACY_ALIASES.containsKey(aliasKey(thingId, prop, kind))
+        if (!isLegacy && !settings.createNewDevices) {
+            logDebug "Skipping new device for ${thingId}/${prop ?: kind} (createNewDevices is off)"
+            return
+        }
+        logDebug "Creating child ${dni} (${driver})"
+        child = addChildDevice("hubitat", driver, dni, [name: name, label: label, isComponent: true])
+    }
+    child.updateDataValue("thingId", thingId)
+    child.updateDataValue("kind", kind)
+    if (prop) child.updateDataValue("propName", prop)
+
+    if (kind == 'fan') child.sendEvent(name: "supportedFanSpeeds", value: JsonOutput.toJson(["low", "medium", "high", "off"]))
+    if (kind == 'thermostat') child.sendEvent(name: "supportedThermostatModes", value: JsonOutput.toJson(["heat", "off"]))
+}
+
+private static String aliasKey(String thingId, String prop, String kind) {
+    return THING_KIND_RULES.values().any { it.kind == kind } ? "${thingId}|__thing__" : "${thingId}|${prop}"
+}
+
+private static String childNameFor(String thingId, String prop, String kind) {
+    def alias = LEGACY_ALIASES[aliasKey(thingId, prop, kind)]
+    if (alias) return alias
+    return prop ? "${shortThingId(thingId)}-${prop}" : shortThingId(thingId)
+}
+
+private static String shortThingId(String thingId) {
+    return thingId.replace('urn:besthing:', '').replace(':', '_')
+}
+
+private static String thingLevelChildName(String thingId) {
+    return LEGACY_ALIASES["${thingId}|__thing__"] ?: shortThingId(thingId)
+}
+
+// The properties a child observes (and refreshes); thing-level kinds have fixed facets.
+private static List<String> observedProps(String kind, String propName) {
+    switch (kind) {
+        case 'thermostat': return ['current', 'target', 'mode']
+        case 'fan': return ['mode']
+        case 'valve': return ['valve']
+        case 'actionSwitch': return []
+        default: return propName ? [propName] : []
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WebSocket lifecycle
+// ---------------------------------------------------------------------------
+
+def connectWebSocket() {
+    state.connected = false
+    try {
+        interfaces.webSocket.close()
+    } catch (Exception ignored) { }
+    def url = "ws://${settings.ipAddress}:${settings.port as int}"
+    logDebug "Connecting to ${url}"
+    try {
+        interfaces.webSocket.connect(url, pingInterval: 30)
+    } catch (Exception e) {
+        log.error "WebSocket connect failed: ${e.message}"
+        scheduleReconnect()
+    }
+}
+
+def webSocketStatus(String message) {
+    logDebug "webSocketStatus: ${message}"
+    if (message.startsWith("status: open")) {
+        state.connected = true
+        state.reconnectDelay = 1
+        sendEvent(name: "connection", value: "connected")
+        log.info "WebSocket connected to ${settings.ipAddress}:${settings.port}"
+        observeAll()
+    } else if (message.startsWith("status: closing") || message.startsWith("failure:")) {
+        if (state.connected) log.warn "WebSocket disconnected: ${message}"
+        state.connected = false
+        sendEvent(name: "connection", value: "disconnected")
+        scheduleReconnect()
+    } else {
+        log.warn "Unhandled webSocketStatus: ${message}"
+    }
+}
+
+private scheduleReconnect() {
+    def delay = state.reconnectDelay ?: 1
+    state.reconnectDelay = Math.min(delay * 2, RECONNECT_MAX_SEC)
+    logDebug "Reconnecting in ${delay}s"
+    runIn(delay, "connectWebSocket")
+}
+
+// Observations are per-connection on the servient: re-register after every (re)connect.
+// Each observe response carries the current value, refreshing all child states for free.
+private void observeAll() {
+    getChildDevices().each { child ->
+        def thingId = child.getDataValue("thingId")
+        if (!thingId) {
+            log.warn "Child ${child.deviceNetworkId} has no WoT mapping (discovery never saw it); skipping"
+            return
+        }
+        observedProps(child.getDataValue("kind"), child.getDataValue("propName")).each { prop ->
+            sendWotRequest([operation: "observeproperty", thingID: thingId, name: prop])
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WoT envelope I/O
+// ---------------------------------------------------------------------------
+
+private void sendWotRequest(Map msg) {
+    if (!state.connected) {
+        log.warn "WebSocket not connected; dropping ${msg.operation} ${msg.thingID}/${msg.name}"
+        return
+    }
+    msg.messageID = UUID.randomUUID().toString()
+    msg.messageType = "request"
+    def json = JsonOutput.toJson(msg)
+    logDebug "WS -> ${json}"
+    interfaces.webSocket.sendMessage(json)
 }
 
 def parse(String description) {
-    def message = null
-    log.debug "Received: ${description}"
-    
-    if (description.contains("type:LAN_TYPE_RAW")) {
-        message = parseTcpMessage(description)
-    } else if (description.contains("headers:") && description.contains("body:")) {
-        message = parseHttpMessage(description)
-    } else {
-        log.warn "Received unhandled data: ${description}"
+    logDebug "WS <- ${description}"
+    def msg
+    try {
+        msg = new JsonSlurper().parseText(description)
+    } catch (Exception e) {
+        log.warn "Received non-JSON frame: ${description.take(200)}"
+        return
     }
 
-    if (message) {
-        processMessage(message)
+    if (msg.error) {
+        log.warn "WoT error for ${msg.thingID}/${msg.name} (${msg.operation}): ${msg.error.status} ${msg.error.detail}"
+        return
     }
-}
 
-private def FanSpeedToAction(String speed) {
-    if (speed.trim() == "off")
-        return "off"
-    else if (speed.trim() == "low")
-        return "on/low"
-    else if (speed.trim() == "medium" || speed.trim() == "medium-low" || speed.trim() == "medium-high")
-        return "on/mid"
-    else if (speed.trim() == "high")
-        return "on/high"
-    
-    return "unknown(${speed})"
-}
-
-private def FanActionToSpeed(String action) {
-    if (action.trim() == "off")
-        return "off"
-    else if (action.trim() == "on/low")
-        return "low"
-    else if (action.trim() == "on/mid")
-        return "medium"
-    else if (action.trim() == "on/high")
-        return "high"
-    
-    return "unknown(${action})"
-}
-
-def updateDeviceStatus(String devName, BigDecimal devNum, String status) {
-    def childDevice = getChildDeviceByNameAndNumber(devName, devNum)
-    if (childDevice) {
-        switch(devName) {
-            case ['batchlight', 'livinglight', 'light01', 'light02', 'light03', 'light04']:
-                childDevice.parse([[name: "switch", value: status == "timeout" ? "unknown" : status]])
-                break
-            case 'temper':
-                childDevice.parse([[name: "thermostatMode", value: status == "timeout" ? "unknown" : status]])
-                break
-            case 'ventil':
-                if (status != "off")
-                    state.lastFanSpeed = FanActionToSpeed(status)
-                childDevice.parse([[name: "speed", value: status == "timeout" ? "unknown" : FanActionToSpeed(status)]])
-                break
-        }
+    switch (msg.operation) {
+        case "readproperty":
+        case "writeproperty":
+        case "observeproperty":
+            // responses and observe notifications all carry the current value
+            if (msg.containsKey("value")) updateFromWot(msg.thingID as String, msg.name as String, msg.value)
+            break
+        case "invokeaction":
+            // correlationID round-trips "<childDNI>|<value>" for stateless action switches
+            if (msg.correlationID) {
+                def parts = (msg.correlationID as String).split(/\|/, 2)
+                def child = getChildDevice(parts[0])
+                if (child && parts.size() == 2) {
+                    child.parse([[name: "switch", value: parts[1], descriptionText: "${child.displayName} was turned ${parts[1]}"]])
+                }
+            }
+            break
+        case "unobserveproperty":
+        case "subscribeevent":
+        case "unsubscribeevent":
+            break
+        default:
+            logDebug "Unhandled operation: ${msg.operation}"
     }
 }
 
-// 명령 구현
-def requestDeviceStatus(String devName, BigDecimal devNum) {
-    log.info "requestDeviceStatus called for ${devName} (Number: ${devNum})"
-    def childDevice = fetchChild(devName, devNum, "Switch")
-    if (childDevice) {
-        def msgNo = getNextMsgNo()
-        def xml = bestinXMLDeviceGetStatusRequest(devName, devNum, msgNo, "GET_DEVICE_STATE")
-        bestinSubmitXMLRequest(devName, devNum, msgNo, xml)
+// Route an incoming (thing, property, value) to its child. Child names are a pure function
+// of (thing, prop) — the same childNameFor used at creation — so no index is needed.
+private void updateFromWot(String thingId, String propName, value) {
+    def thingChild = getChildDevice("${device.deviceNetworkId}-${thingLevelChildName(thingId)}")
+    if (thingChild) {
+        handleThingUpdate(thingChild, propName, value)
+        return
+    }
+    def child = getChildDevice("${device.deviceNetworkId}-${childNameFor(thingId, propName, 'property')}")
+    if (child) {
+        handlePropUpdate(child, value)
+        return
+    }
+    logDebug "No child for ${thingId}/${propName} = ${value}"
+}
+
+// Facet updates of a whole-Thing child (thermostat / fan / valve).
+private void handleThingUpdate(child, String propName, value) {
+    switch (child.getDataValue("kind")) {
+        case 'thermostat':
+            switch (propName) {
+                case 'current':
+                    child.parse([[name: "temperature", value: value, unit: "°C"]])
+                    break
+                case 'target':
+                    child.parse([[name: "heatingSetpoint", value: value, unit: "°C"],
+                                 [name: "thermostatSetpoint", value: value, unit: "°C"]])
+                    break
+                case 'mode':
+                    child.parse([[name: "thermostatMode", value: wotThermoModeToHubitat(value as String)],
+                                 [name: "thermostatOperatingState", value: value == "heat" ? "heating" : "idle"]])
+                    break
+            }
+            break
+        case 'fan':
+            if (propName != 'mode') { logDebug "Unmapped fan property ${propName} = ${value}"; return }
+            def speed = wotWindToSpeed(value as String)
+            if (speed != "off") state.lastFanSpeed = speed
+            child.parse([[name: "speed", value: speed, descriptionText: "${child.displayName} speed is ${speed}"]])
+            break
+        case 'valve':
+            if (propName != 'valve') return
+            // 'operation' is a transitional motor state; report only settled positions
+            if (value == 'open' || value == 'close') {
+                child.parse([[name: "valve", value: value == 'open' ? 'open' : 'closed']])
+            }
+            break
     }
 }
 
-def setLightState(String devName, BigDecimal devNum, String state) {
-    log.info "setLightState called for ${devName} (Number: ${devNum}) with state: ${state}"
-    def childDevice = fetchChild(devName, devNum, "Switch")
-    if (childDevice) {
-        def msgNo = getNextMsgNo()
-        def xml = bestinXMLDeviceSetControlRequest(devName, devNum, msgNo, state, "SET_LIGHT_STATE")
-        bestinSubmitXMLRequest(devName, devNum, msgNo, xml)
+// Updates of a per-property child (switch / power / motion / contact).
+private void handlePropUpdate(child, value) {
+    switch (child.getDataValue("kind")) {
+        case 'switch':
+            child.parse([[name: "switch", value: value, descriptionText: "${child.displayName} was turned ${value}"]])
+            break
+        case 'power':
+            child.parse([[name: "power", value: value, unit: "W"]])
+            break
+        case 'motion':
+            child.parse([[name: "motion", value: value == 'detect' ? 'active' : 'inactive']])
+            break
+        case 'contact':
+            child.parse([[name: "contact", value: value == 'detect' ? 'open' : 'closed']])
+            break
+        default:
+            logDebug "No update handler for kind ${child.getDataValue('kind')}"
     }
+}
+
+// ---------------------------------------------------------------------------
+// Value conversions (Hubitat <-> TD vocabularies)
+// ---------------------------------------------------------------------------
+
+private static String hubitatSpeedToWotWind(String speed) {
+    switch (speed?.trim()) {
+        case "off": return "off"
+        case "low":
+        case "medium-low": return "low"
+        case "medium":
+        case "medium-high": return "mid"
+        case "high": return "high"
+        default: return null
+    }
+}
+
+private static String wotWindToSpeed(String wind) {
+    switch (wind) {
+        case "off": return "off"
+        case "low": return "low"
+        case "mid": return "medium"
+        case "high": return "high"
+        default: return "unknown(${wind})"
+    }
+}
+
+// TD mode enum: off/heat/sleep/reservation/pause; only off/heat/pause are client-settable.
+private static String wotThermoModeToHubitat(String mode) {
+    switch (mode) {
+        case "heat": return "heat"
+        case "sleep":
+        case "reservation": return "auto"
+        default: return "off"   // off, pause
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Commands (legacy parent commands kept for compatibility)
+// ---------------------------------------------------------------------------
+
+private getLegacyChild(String devName, def devNum) {
+    def child = getChildDevice("${device.deviceNetworkId}-${devName}-${devNum}")
+    if (!child) log.warn "No child device ${devName}-${devNum}"
+    return child
+}
+
+def setLightState(String devName, BigDecimal devNum, String value) {
+    log.info "setLightState ${devName}-${devNum} -> ${value}"
+    def child = getLegacyChild(devName, devNum as int)
+    if (child) switchChildTo(child, value)
 }
 
 def setTemperature(String devName, BigDecimal devNum, BigDecimal temperature) {
-    log.info "setTemperature called for ${devName} (Number: ${devNum}) with temperature: ${temperature}"
-    def childDevice = fetchChild(devName, devNum, "Thermostat")
-    if (childDevice) {
-        def msgNo = getNextMsgNo()
-        def xml = bestinXMLDeviceSetControlRequest(devName, devNum, msgNo, temperature.toString(), "SET_TEMPERATURE")
-        bestinSubmitXMLRequest(devName, devNum, msgNo, xml)
-    }
+    log.info "setTemperature ${devName}-${devNum} -> ${temperature}"
+    def child = getLegacyChild(devName, devNum as int)
+    if (child) componentSetHeatingSetpoint(child, temperature)
 }
 
 def setThermostatMode(String devName, BigDecimal devNum, String mode) {
-    log.info "setThermostatMode called for ${devName} (Number: ${devNum}) with mode: ${mode}"
-    def childDevice = fetchChild(devName, devNum, "Thermostat")
-    if (childDevice) {
-        def msgNo = getNextMsgNo()
-        def xml = bestinXMLDeviceSetControlRequest(devName, devNum, msgNo, mode, "SET_THERMOSTAT_MODE")
-        bestinSubmitXMLRequest(devName, devNum, msgNo, xml)
-    }
+    log.info "setThermostatMode ${devName}-${devNum} -> ${mode}"
+    def child = getLegacyChild(devName, devNum as int)
+    if (child) componentSetThermostatMode(child, mode)
 }
 
 def controlAirVentilator(String devName, BigDecimal devNum, String fanSpeed) {
-    log.info "controlAirVentilator called for ${devName} (Number: ${devNum}) with fan speed: ${fanSpeed}, last: ${state.lastFanSpeed}"
-    def childDevice = fetchChild(devName, devNum, "Fan Control")
-    if (childDevice) {
-        if (fanSpeed == "on")
-            fanSpeed = state.lastFanSpeed
-        else if (fanSpeed != "off")
-            state.lastFanSpeed = fanSpeed
-
-        def msgNo = getNextMsgNo()
-        def xml = bestinXMLDeviceSetControlRequest(devName, devNum, msgNo, FanSpeedToAction(fanSpeed), "CONTROL_AIR_VENTILATOR")
-        // log.info xml.encodeAsBase64()
-        bestinSubmitXMLRequest(devName, devNum, msgNo, xml)
-    }
+    log.info "controlAirVentilator ${devName}-${devNum} -> ${fanSpeed}"
+    def child = getLegacyChild(devName, devNum as int)
+    if (child) componentSetSpeed(child, fanSpeed)
 }
 
 def updateAllStatus() {
-    log.debug "updateAllStatus called for all child devices"
-    
-    def children = getChildDevices()
-    children.each { child ->
-        log.debug "Updating status for child device: ${child.deviceNetworkId}"
-        try {
-            def (devName, devNum) = child.name.split('-')
-            requestDeviceStatus(devName, devNum as BigDecimal)
-        } catch (Exception e) {
-            log.error "Error updating status for child device ${child.deviceNetworkId}: ${e.message}"
-        }
-    }
+    logDebug "updateAllStatus called for all child devices"
+    getChildDevices().each { child -> componentRefresh(child) }
 }
 
 def deleteAllDevices() {
-    log.debug "deleteAllDevices called for all child devices"
-    
-    def children = getChildDevices()
-    children.each { child ->
-        log.debug "delete child device: ${child.deviceNetworkId}"
+    logDebug "deleteAllDevices called for all child devices"
+    getChildDevices().each { child ->
         try {
             deleteChildDevice(child.deviceNetworkId)
         } catch (Exception e) {
@@ -229,389 +516,86 @@ def deleteAllDevices() {
     }
 }
 
-private def fetchChild(String devName, BigDecimal devNum, String type) {
-    if (devNum == null) {
-        log.error "fetchChild called with null devNum for device: ${devName}"
-        return null
-    }
+// ---------------------------------------------------------------------------
+// Child component callbacks
+// ---------------------------------------------------------------------------
 
-    def childDeviceNetworkId = "${device.deviceNetworkId}-${devName}-${devNum}"
-    def childDevice = getChildDevice(childDeviceNetworkId)
-    
-    if (!childDevice) {
-        log.debug "Child device not found. Creating new child device: ${childDeviceNetworkId}"
-        switch(type) {
-            case "Switch":
-            case "Thermostat":
-            case "Fan Control":
-                childDevice = addChildDevice("hubitat", "Generic Component ${type}", childDeviceNetworkId,
-                                             [ name: "${devName}-${devNum}", isComponent: true ]
-                                            )
-                break
-            default:
-                log.warn "Unknown device type: ${type}. Child device not created."
-                return null
-        }
-    }
-    
-    return childDevice
-}
-
-// Child Device Methods
 void componentRefresh(childDevice) {
-    log.debug "componentRefresh called with child device: ${childDevice}"
-    def (devName, devNum) = childDevice.name.split('-')
-    requestDeviceStatus(devName, devNum as BigDecimal)
+    def thingId = childDevice.getDataValue("thingId")
+    if (!thingId) return
+    observedProps(childDevice.getDataValue("kind"), childDevice.getDataValue("propName")).each { prop ->
+        sendWotRequest([operation: "readproperty", thingID: thingId, name: prop])
+    }
 }
 
-void componentOn(childDevice) {
-    log.debug "componentOn called with child device: ${childDevice}"
-    def (devName, devNum) = childDevice.name.split('-')
-    setLightState(devName, devNum as BigDecimal, "on")
-}
+void componentOn(childDevice) { switchChildTo(childDevice, "on") }
+void componentOff(childDevice) { switchChildTo(childDevice, "off") }
 
-void componentOff(childDevice) {
-    log.debug "componentOff called with child device: ${childDevice}"
-    def (devName, devNum) = childDevice.name.split('-')
-    setLightState(devName, devNum as BigDecimal, "off")
+private void switchChildTo(child, String value) {
+    def thingId = child.getDataValue("thingId")
+    def propName = child.getDataValue("propName")
+    switch (child.getDataValue("kind")) {
+        case 'switch':
+            sendWotRequest([operation: "writeproperty", thingID: thingId, name: propName, value: value])
+            break
+        case 'actionSwitch':
+            // No observable state: the child's switch is set from the invokeaction reply.
+            sendWotRequest([operation: "invokeaction", thingID: thingId, name: propName, input: value,
+                            correlationID: "${child.deviceNetworkId}|${value}".toString()])
+            break
+        default:
+            log.warn "on/off not supported for ${child.displayName} (kind ${child.getDataValue('kind')})"
+    }
 }
 
 void componentSetSpeed(childDevice, speed) {
-    log.debug "componentSetSpeed called with child device: ${childDevice}, speed: ${speed}"
-    def (devName, devNum) = childDevice.name.split('-')
-    controlAirVentilator(devName, devNum as BigDecimal, speed)
+    def fanSpeed = speed == "on" ? state.lastFanSpeed : speed
+    def wind = hubitatSpeedToWotWind(fanSpeed as String)
+    if (!wind) {
+        log.warn "Unsupported fan speed: ${speed}"
+        return
+    }
+    if (wind != "off") state.lastFanSpeed = wotWindToSpeed(wind)
+    sendWotRequest([operation: "writeproperty", thingID: childDevice.getDataValue("thingId"), name: "mode", value: wind])
+}
+
+void componentCycleSpeed(childDevice) {
+    def next = [low: "medium", medium: "high", high: "low"][childDevice.currentValue("speed")] ?: "low"
+    componentSetSpeed(childDevice, next)
 }
 
 void componentSetHeatingSetpoint(childDevice, temperature) {
-    log.debug "componentSetHeatingSetpoint called with child device: ${childDevice}, temperature: ${temperature}"
-    def (devName, devNum) = childDevice.name.split('-')
-    setTemperature(devName, devNum as BigDecimal, temperature)
+    // TD: 5..40 in 0.5 steps
+    def target = Math.min(Math.max(Math.round(((temperature as BigDecimal) * 2).doubleValue()) / 2.0d, 5.0d), 40.0d)
+    sendWotRequest([operation: "writeproperty", thingID: childDevice.getDataValue("thingId"), name: "target", value: target])
 }
 
-// Helper method to get child device by name and number
-private getChildDeviceByNameAndNumber(String devName, BigDecimal devNum) {
-    def childDeviceNetworkId = "${device.deviceNetworkId}-${devName}-${devNum}"
-    return getChildDevice(childDeviceNetworkId)
-}
-
-private bestinXMLDeviceGetStatusRequest(String devName, BigDecimal devNum, Integer msgNo, String cmdId) {
-    def xml = """
-        <?xml version="1.0" encoding="utf-8"?>
-        <imap ver="1.0" address="10.3.7.1" sender="${settings.sender}">
-        <service type="request" name="msg_home_device_get_status">
-            <target name="hubitat" id="1" msg_no="${msgNo}" />
-            <model_id>${devName}</model_id>
-            <dev_num>${devNum}</dev_num>
-            <command_id>${cmdId}</command_id>
-        </service>
-        </imap>
-    """
-    return xml
-}
-
-private bestinXMLDeviceSetControlRequest(String devName, BigDecimal devNum, BigDecimal msgNo, String action, String cmdId) {
-    def xml = """
-        <?xml version="1.0" encoding="utf-8"?>
-        <imap ver="1.0" address="10.3.7.1" sender="${settings.sender}">
-        <service type="request" name="msg_home_device_set_control">
-            <target name="hubitat" id="1" msg_no="${msgNo}" />
-            <model_id>${devName}</model_id>
-            <dev_num>${devNum}</dev_num>
-            <action>${action}</action>
-            <command_id>${cmdId}</command_id>
-        </service>
-        </imap>
-    """
-    return xml
-}
-
-// msg_no 생성 메서드
-private getNextMsgNo() {
-    state.msgNoCounter = (state.msgNoCounter + 1) % 1000000 // 큰 수로 순환
-    return state.msgNoCounter
-}
-
-private bestinSubmitXMLRequest(String devName, BigDecimal devNum, BigDecimal msgNo, String xml) {
-    log.debug "bestinSubmitXMLRequest called with child device: ${devName}-${devNum} msgNo:${msgNo}"
-    //state.submitedCommands.offer([msgNo: msgNo, devName: devName, devNum: devNum, xml: xml])
-    state.submitedCommands.add([msgNo: msgNo, devName: devName, devNum: devNum, xml: xml])
-    bestinProcessSubmitedXMLRequest()
-}
-
-private bestinProcessSubmitedXMLRequest() {
-    while (state.sendingCommandCount < 1) {
-        try {
-        def command = state.submitedCommands.remove(0)
-            if (command) {
-                bestinSendXMLRequest(command.devName, command.devNum, command.msgNo, command.xml)
-            }
-        } catch (IndexOutOfBoundsException e) {
-            break
-        }
+void componentSetThermostatMode(childDevice, mode) {
+    if (!(mode in ["heat", "off"])) {
+        log.warn "Thermostat mode '${mode}' not supported by the wallpad (heat/off only)"
+        return
     }
+    sendWotRequest([operation: "writeproperty", thingID: childDevice.getDataValue("thingId"), name: "mode", value: mode])
 }
 
-// XML 요청 메서드
-private bestinSendXMLRequest(String devName, BigDecimal devNum, BigDecimal msgNo, String xml) {
-    log.debug "bestinSendXMLRequest called with child device: ${devName}-${devNum}"
-    state.sendingCommands.put(msgNo.toString(), [devName: devName, devNum: devNum, time: new Date().time])
-    state.sendingCommandCount++//.incrementAndGet()
-    sendTcpMessage(xml)
+void componentHeat(childDevice) { componentSetThermostatMode(childDevice, "heat") }
+void componentAuto(childDevice) { log.warn "auto mode not supported" }
+void componentCool(childDevice) { log.warn "cool mode not supported" }
+void componentEmergencyHeat(childDevice) { log.warn "emergency heat not supported" }
+void componentSetCoolingSetpoint(childDevice, temperature) { log.warn "cooling setpoint not supported" }
+void componentFanAuto(childDevice) { log.warn "thermostat fan not supported" }
+void componentFanCirculate(childDevice) { log.warn "thermostat fan not supported" }
+void componentFanOn(childDevice) { log.warn "thermostat fan not supported" }
+
+// Gas valve: remote close only — opening requires physical action at the wallpad.
+void componentClose(childDevice) {
+    sendWotRequest([operation: "invokeaction", thingID: childDevice.getDataValue("thingId"), name: "close", input: -1])
 }
 
-def bestinCheckCommandTimeouts() {
-    def now = new Date().time
-    def timeoutThreshold = 5
-
-    // ERROR: groovy.lang.MissingMethodException: No signature of method
-    // boolean removedAny = state.sendingCommands.removeIf { msgNo, command -> 
-    //     if (now - command.time > timeoutThreshold * 1000) {
-    //         log.warn "Command timed out: ${command}"
-    //         updateDeviceStatus(command.devName, command.devNum, "timeout")
-    //         return true
-    //     }
-    //     return false
-    // }
-
-    def iterator = state.sendingCommands.entrySet().iterator()
-    while (iterator.hasNext()) {
-        def entry = iterator.next()
-        try {
-            if (now - entry.value.time > timeoutThreshold * 1000) {
-                log.warn "Command timed out: ${entry.value}"
-                updateDeviceStatus(entry.value.devName, entry.value.devNum, "timeout")
-                iterator.remove()
-                state.sendingCommandCount--//.decrementAndGet()
-            }
-        } catch (IllegalStateException e) {
-            log.warn "Command already removed: ${entry.key}"
-        }
-    }
-
-    bestinProcessSubmitedXMLRequest()
-    // if (new Date().getTime() - state.latestSendTime > 5000)
-    //     sendTcpMessage("Poll")
+void componentOpen(childDevice) {
+    log.warn "Gas valve cannot be opened remotely"
 }
 
-// <imap ver = "1.0" address = "10.3.7.1" sender = "203동 701호">
-//     <service type = "notice" name= "msg_home_devices_status_event">
-//         <devinfo name = "livinglight" value = "5">
-//             <status name="livinglight" dev_num="1">off</status>
-//             <status name="livinglight" dev_num="2">on</status>
-//             <status name="livinglight" dev_num="3">off</status>
-//             <status name="livinglight" dev_num="4">off</status>
-//             <status name="livinglight" dev_num="5">off</status>
-//         </devinfo>
-//         <devinfo name = "gas" value = "1">
-//             <status name="gas" dev_num="1">close</status>
-//         </devinfo>
-//         <devinfo name = "ventil" value = "1">
-//             <status name="ventil" dev_num="1">on/high</status>
-//         </devinfo>
-//         <devinfo name = "batchlight" value = "1">
-//             <status name="batchlight" dev_num="1">off</status>
-//         </devinfo>
-//         <devinfo name = "temper" value = "4">
-//             <status name="temper" dev_num="1">off/25.0/28.2</status>
-//             <status name="temper" dev_num="2">off/24.5/28.7</status>
-//             <status name="temper" dev_num="3">off/24.5/29.5</status>
-//             <status name="temper" dev_num="4">off/23.5/29.6</status>
-//         </devinfo>
-//         <devinfo name = "light" value = "4">
-//             <subdevinfo name="light01" value ="3" >
-//                 <status name="light01" dev_num="1">on</status>
-//                 <status name="light01" dev_num="2">off</status>
-//                 <status name="light01" dev_num="3">on</status>
-//             </subdevinfo>
-//             <subdevinfo name="light02" value ="2" >
-//                 <status name="light02" dev_num="1">off</status>
-//                 <status name="light02" dev_num="2">off</status>
-//             </subdevinfo>
-//             <subdevinfo name="light03" value ="2" >
-//                 <status name="light03" dev_num="1">off</status>
-//                 <status name="light03" dev_num="2">off</status>
-//             </subdevinfo>
-//             <subdevinfo name="light04" value ="2" >
-//                 <status name="light04" dev_num="1">off</status>
-//                 <status name="light04" dev_num="2">on</status>
-//             </subdevinfo>
-//         </devinfo>
-//         <devinfo name = "electric" value = "4">
-//             <subdevinfo name="electric01" value ="2" >
-//                 <status name="electric01" dev_num="1">unset/on</status>
-//                 <status name="electric01" dev_num="2">unset/on</status>
-//             </subdevinfo>
-//             <subdevinfo name="electric02" value ="2" >
-//                 <status name="electric02" dev_num="1">unset/on</status>
-//                 <status name="electric02" dev_num="2">unset/on</status>
-//             </subdevinfo>
-//             <subdevinfo name="electric03" value ="2" >
-//                 <status name="electric03" dev_num="1">unset/on</status>
-//                 <status name="electric03" dev_num="2">unset/on</status>
-//             </subdevinfo>
-//             <subdevinfo name="electric04" value ="2" >
-//                 <status name="electric04" dev_num="1">unset/on</status>
-//                 <status name="electric04" dev_num="2">unset/on</status>
-//             </subdevinfo>
-//         </devinfo>
-//     </service>
-// </imap>
-
-// <imap ver = "1.0" address = "10.3.7.1" sender = "203동701호">
-//    <service type = "notice" name= "msg_device_event">
-//       <model_id>light03</model_id>
-//       <dev_num>1</dev_num>
-//       <status>on</status>
-//    </service>
-// </imap>
-private bestinHandleNotice(xml) {
-    def service_name = xml.service.@name.text()
-
-    if (service_name == "msg_device_event") {
-        def devName = xml.service.model_id.text()
-        def devNum = xml.service.dev_num.text()
-        def status = xml.service.status.text()
-        
-        log.info "bestinHandleNotice device notice devName ${devName}, devNum ${devNum}, status ${status}"
-        updateDeviceStatus(devName, new BigDecimal(devNum), status)
-    } else if (service_name == "msg_home_devices_status_event") {
-        def list = xml.'**'.findAll { it.name() == "status" } 
-        list.each {
-            xmlStatus ->
-            def devName = xmlStatus.@name.text()
-            def devNum = xmlStatus.@dev_num.text()
-            def status = xmlStatus.text()
-            
-            log.info "bestinHandleNotice devices notice devName ${devName}, devNum ${devNum}, status ${status}"
-            updateDeviceStatus(devName, new BigDecimal(devNum), status)
-        }
-    } else {
-        log.warn "Received notice for unknown service name: '${service_name}'"
-    }
-}
-
-// <imap ver = "1.0" address = "10.3.7.1" sender = "203동701호">
-//    <service type = "reply" name= "msg_home_device_set_control" result = "ok">
-//        <target name="wallpad" id="1" msg_no="35047" />
-//        <model_id>light03</model_id>
-//        <dev_num>1</dev_num>
-//        <status>on</status>
-//        <command_id>SET_LIGHT_STATE</command_id>
-//    </service>
-// </imap>
-private bestinHandleReply(xml) {
-    def result = xml.service.@result.text()
-    def msgNo = xml.service.target.@msg_no.toString()
-
-    log.debug "bestinHandleReply result ${result}, msg_no ${msgNo}"
-    log.debug "bestinHandleReply ${state.sendingCommands}"
-    
-    def command = state.sendingCommands.remove(msgNo)
-    if (command) {
-        log.debug "Received reply for command: ${command}, result: ${result}"
-        
-        state.sendingCommandCount--//.decrementAndGet()
-
-        if (result == "ok") {
-            def devName = xml.service.model_id.text()
-            def devNum = xml.service.dev_num.text()
-            def status = xml.service.status.text()
-            
-            log.info "bestinHandleReply Reply devName ${devName}, devNum ${devNum}, status ${status}, elapsed ${new Date().time - command.time}"
-            updateDeviceStatus(devName, new BigDecimal(devNum), status)
-        } else {
-            log.warn "Received reply for result fail: ${result}"
-        }
-    } else {
-        log.warn "Received reply for unknown msg_no: ${msgNo}"
-    }
-
-    bestinProcessSubmitedXMLRequest()
-}
-
-private sendTcpMessage(String message) {
-    def hubAction = new HubAction(
-        message,
-        Protocol.LAN,
-        [
-            type: HubAction.Type.LAN_TYPE_RAW,
-            destinationAddress: "${settings.ipAddress}:${settings.port}"
-        ]
-    )
-    sendHubCommand(hubAction)
-    state.latestSendTime = new Date().getTime()
-}
-
-private parseHttpMessage(String description) {
-    // HEX_STRING에서 실제 hex 값 추출
-    def descs = description.split("body:")
-    if (descs.size() < 2)
-        return null
-
-    def hexString = descs[1]
-
-    // Base64를 바이트 배열로 변환
-    byte[] bytes = hexString.decodeBase64()
-    
-    // 바이트 배열을 문자열로 변환
-    String decodedString = new String(bytes, "UTF-8").trim()
-    
-    return decodedString
-}
-
-private parseTcpMessage(String description) {
-    // HEX_STRING에서 실제 hex 값 추출
-    def descs = description.split("payload:")
-    if (descs.size() < 2)
-        return null
-
-    def hexString = descs[1]
-
-    // Base64를 바이트 배열로 변환
-    byte[] bytes = hexString.decodeBase64()
-    
-    // 바이트 배열을 문자열로 변환
-    String decodedString = new String(bytes, "UTF-8").trim()
-    
-    return decodedString
-}
-
-private processMessage(String message) {
-    // 여기서 받은 메시지를 처리합니다.
-    // 예: 상태 업데이트, 명령 응답 처리 등
-    log.debug "Processing message: ${message}"
-
-    def rawXmlList = message.split("</imap>");
-    rawXmlList.each { rawXml ->
-        rawXml += "</imap>"
-        log.debug "XML in message: ${rawXml}"
-
-        // 메시지 내용에 따라 적절한 처리 로직 구현
-        def cleanedXml = rawXml.trim() // 앞뒤 공백 제거
-        
-        // BOM 제거 (UTF-8 BOM인 경우)
-        if (cleanedXml.startsWith("\uFEFF")) {
-            cleanedXml = cleanedXml.substring(1)
-        }
-        
-        // XML 선언이 없는 경우 추가
-        if (!cleanedXml.startsWith("<?xml")) {
-            cleanedXml = "<?xml version='1.0' encoding='UTF-8'?>\n" + cleanedXml
-        }
-        
-        try {
-            def xmlSlurper = new XmlSlurper()
-            def xml = xmlSlurper.parseText(cleanedXml)
-            log.debug "XML 내용: ${cleanedXml}"
-            if (xml.service.@type == "notice") {
-                bestinHandleNotice(xml)
-            }
-            else if (xml.service.@type == "reply") {
-                bestinHandleReply(xml)
-            }
-        } catch (org.xml.sax.SAXParseException e) {
-            log.error "XML 파싱 오류: ${e.message}"
-            log.debug "문제의 XML 내용: ${cleanedXml}"
-        }
-    }
+private void logDebug(String msg) {
+    if (settings.logEnable != false) log.debug msg
 }
