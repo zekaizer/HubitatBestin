@@ -67,10 +67,10 @@ preferences {
 // ---------------------------------------------------------------------------
 
 // Things modeled as ONE child for the whole Thing (its properties are facets of one device).
+// (GasValve is not mapped yet: this hub has no "Generic Component Valve" driver.)
 @Field static final Map THING_KIND_RULES = [
     'wallpad:Thermostat' : [kind: 'thermostat', driver: 'Generic Component Thermostat'],
     'wallpad:Ventilation': [kind: 'fan',        driver: 'Generic Component Fan Control'],
-    'wallpad:GasValve'   : [kind: 'valve',      driver: 'Generic Component Valve'],
 ]
 
 @Field static final Map DRIVER_FOR_KIND = [
@@ -143,7 +143,13 @@ private void runDiscovery() {
         log.warn "TD discovery failed; keeping existing children as-is"
         return
     }
-    tds.each { td -> discoverThing(td) }
+    tds.each { td ->
+        try {
+            discoverThing(td)
+        } catch (Exception e) {
+            log.error "Discovery failed for ${td.id}: ${e.message}"
+        }
+    }
 }
 
 private List fetchTdCatalog() {
@@ -199,8 +205,10 @@ private void ensureChildFor(String thingId, String prop, String kind, String dri
     def dni = "${device.deviceNetworkId}-${name}"
     def child = getChildDevice(dni)
     if (!child) {
-        boolean isLegacy = LEGACY_ALIASES.containsKey(aliasKey(thingId, prop, kind))
-        if (!isLegacy && !settings.createNewDevices) {
+        // LEGACY_ALIASES only adopts pre-existing children; creating anything new
+        // (legacy-named or not) is gated behind the createNewDevices preference.
+        // Preferences set through the API may arrive as the STRING "false" (truthy!).
+        if (settings.createNewDevices?.toString() != 'true') {
             logDebug "Skipping new device for ${thingId}/${prop ?: kind} (createNewDevices is off)"
             return
         }
