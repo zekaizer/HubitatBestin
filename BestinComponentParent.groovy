@@ -23,7 +23,8 @@ import groovy.transform.Field
  */
 
 metadata {
-    definition (name: "Hubitat Bestin", namespace: "bestin", author: "Luke Lee") {
+    definition (name: "Hubitat Bestin", namespace: "bestin", author: "Luke Lee",
+                importUrl: "https://raw.githubusercontent.com/zekaizer/HubitatBestin/main/BestinComponentParent.groovy") {
         capability "Configuration"
         capability "Initialize"
 

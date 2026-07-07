@@ -1,0 +1,12 @@
+{
+	"author": "Luke Lee",
+	"gitHubUrl": "https://github.com/zekaizer/HubitatBestin",
+	"packages": [
+		{
+			"name": "Hubitat Bestin",
+			"category": "Integrations",
+			"location": "https://raw.githubusercontent.com/zekaizer/HubitatBestin/main/packageManifest.json",
+			"description": "BESTIN / i-PARK wallpad integration via the besthing WoT servient (Web Thing Protocol over WebSocket): lights, outlets, ventilation, thermostats and more as component devices."
+		}
+	]
+}
