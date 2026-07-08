@@ -99,6 +99,7 @@ preferences {
     'urn:besthing:light:room3|switch2' : 'light03-2',
     'urn:besthing:light:room4|switch1' : 'light04-1',
     'urn:besthing:light:room4|switch2' : 'light04-2',
+    'urn:besthing:light:batch|batch'   : 'batchlight-1',
     'urn:besthing:ventil|__thing__'    : 'ventil-1',
     'urn:besthing:thermostat:room1|__thing__': 'temper-1',
     'urn:besthing:thermostat:room2|__thing__': 'temper-2',
