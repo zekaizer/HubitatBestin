@@ -29,7 +29,7 @@ metadata {
         capability "Initialize"
 
         command "setLightState", [
-            [name: "Device Name", type: "ENUM", constraints: ['batchlight', 'livinglight', 'light01', 'light02', 'light03', 'light04']],
+            [name: "Device Name", type: "ENUM", constraints: ['livinglight', 'light01', 'light02', 'light03', 'light04']],
             [name: "Device Number", type: "NUMBER", description: "Number of the device"],
             [name: "Light State", type: "ENUM", constraints: ["on", "off"]]
         ]
@@ -99,7 +99,6 @@ preferences {
     'urn:besthing:light:room3|switch2' : 'light03-2',
     'urn:besthing:light:room4|switch1' : 'light04-1',
     'urn:besthing:light:room4|switch2' : 'light04-2',
-    'urn:besthing:light|all_lights'    : 'batchlight-1',
     'urn:besthing:ventil|__thing__'    : 'ventil-1',
     'urn:besthing:thermostat:room1|__thing__': 'temper-1',
     'urn:besthing:thermostat:room2|__thing__': 'temper-2',
