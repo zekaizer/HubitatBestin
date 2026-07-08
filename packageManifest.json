@@ -2,10 +2,10 @@
 	"packageName": "Hubitat Bestin",
 	"minimumHEVersion": "2.3.9",
 	"author": "Luke Lee",
-	"version": "1.2.0",
+	"version": "1.2.1",
 	"dateReleased": "2026-07-09",
 	"licenseFile": "https://raw.githubusercontent.com/zekaizer/HubitatBestin/main/LICENSE",
-	"releaseNotes": "Drive thermostatOperatingState from the wallpad's new operating property (real boiler-valve heating/idle state) instead of deriving it from the mode, so a room in heat mode correctly shows idle while its setpoint is satisfied.",
+	"releaseNotes": "Heating-only thermostat cleanup: advertise no fan modes so HomeKit and dashboards hide the fan, and clamp the heating setpoint to the usable 15-30C band.",
 	"drivers" : [
 		{
 			"id": "a8bab504-a788-4ba0-8188-9cd85b7ea33a",
