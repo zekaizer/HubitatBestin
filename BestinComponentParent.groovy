@@ -260,7 +260,11 @@ private void ensureChildFor(String thingId, String prop, String kind, String dri
     if (prop) child.updateDataValue("propName", prop)
 
     if (kind == 'fan') child.sendEvent(name: "supportedFanSpeeds", value: JsonOutput.toJson(["low", "medium", "high", "off"]))
-    if (kind == 'thermostat') child.sendEvent(name: "supportedThermostatModes", value: JsonOutput.toJson(["heat", "off"]))
+    if (kind == 'thermostat') {
+        // Heating-only wallpad: advertise no fan modes so HomeKit/dashboards hide the fan.
+        child.sendEvent(name: "supportedThermostatModes", value: JsonOutput.toJson(["heat", "off"]))
+        child.sendEvent(name: "supportedThermostatFanModes", value: JsonOutput.toJson([]))
+    }
 }
 
 private static String aliasKey(String thingId, String prop, String kind) {
