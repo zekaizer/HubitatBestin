@@ -60,6 +60,7 @@ preferences {
     input name: "ipAddress", type: "text", title: "IP Address", required: true
     input name: "port", type: "number", title: "Port", required: true, defaultValue: 8788
     input name: "createNewDevices", type: "bool", title: "Create child devices for newly discovered affordances", defaultValue: false
+    input name: "newDeviceAllowlist", type: "text", title: "Only create these child names (comma-separated; blank = all)", required: false
     input name: "logEnable", type: "bool", title: "Enable debug logging", defaultValue: true
 }
 
@@ -72,6 +73,14 @@ preferences {
 @Field static final Map THING_KIND_RULES = [
     'wallpad:Thermostat' : [kind: 'thermostat', driver: 'Generic Component Thermostat'],
     'wallpad:Ventilation': [kind: 'fan',        driver: 'Generic Component Fan Control'],
+    'wallpad:Doorlock'   : [kind: 'lock',       driver: 'Generic Component Lock'],
+]
+
+// The wireless doorlock reports no lock-status, so its lock child mirrors a door magnetic
+// reed on a *different* Thing: door open (detect) -> unlocked, door closed (normal) -> locked.
+// Maps the doorlock thingId to its state source (thingId + property).
+@Field static final Map LOCK_STATE_SOURCE = [
+    'urn:besthing:doorlock': [thingId: 'urn:besthing:sensor', prop: 'magnetic'],
 ]
 
 @Field static final Map DRIVER_FOR_KIND = [
@@ -108,6 +117,10 @@ preferences {
 ]
 
 @Field static final int RECONNECT_MAX_SEC = 60
+
+// After an optimistic unlock, wait this long before reconciling the lock child to the
+// real door state (in case the door magnetic never reports an opening).
+@Field static final int RELOCK_SECONDS = 5
 
 def installed() {
     logDebug "installed()"
@@ -231,8 +244,16 @@ private void ensureChildFor(String thingId, String prop, String kind, String dri
             logDebug "Skipping new device for ${thingId}/${prop ?: kind} (createNewDevices is off)"
             return
         }
+        // Optional allowlist: when set, only the listed child names are created.
+        def allow = (settings.newDeviceAllowlist ?: '').split(',')*.trim().findAll { it }
+        if (allow && !(name in allow)) {
+            logDebug "Skipping ${name}: not in newDeviceAllowlist"
+            return
+        }
         logDebug "Creating child ${dni} (${driver})"
         child = addChildDevice("hubitat", driver, dni, [name: name, label: label, isComponent: true])
+        // The doorlock has no observable state; seed the resting "locked" position once.
+        if (kind == 'lock') child.sendEvent(name: "lock", value: "locked")
     }
     child.updateDataValue("thingId", thingId)
     child.updateDataValue("kind", kind)
@@ -267,6 +288,7 @@ private static List<String> observedProps(String kind, String propName) {
         case 'thermostat': return ['current', 'target', 'mode']
         case 'fan': return ['mode']
         case 'valve': return ['valve']
+        case 'lock': return []   // momentary release action; no readable state
         case 'actionSwitch': return []
         default: return propName ? [propName] : []
     }
@@ -418,6 +440,7 @@ def parse(String description) {
 // Route an incoming (thing, property, value) to its child. Child names are a pure function
 // of (thing, prop) — the same childNameFor used at creation — so no index is needed.
 private void updateFromWot(String thingId, String propName, value) {
+    reflectDoorlockState(thingId, propName, value)
     def thingChild = getChildDevice("${device.deviceNetworkId}-${thingLevelChildName(thingId)}")
     if (thingChild) {
         handleThingUpdate(thingChild, propName, value)
@@ -653,6 +676,56 @@ void componentClose(childDevice) {
 
 void componentOpen(childDevice) {
     log.warn "Gas valve cannot be opened remotely"
+}
+
+// Doorlock: momentary remote release only (the wallpad relays SetWddrCont, no input).
+// The lock has no status of its own, so we show "unlocked" optimistically and let the
+// door magnetic settle the real state; relock() reconciles if the door never opens.
+void componentUnlock(childDevice) {
+    sendWotRequest([operation: "invokeaction", thingID: childDevice.getDataValue("thingId"), name: "open"])
+    childDevice.parse([[name: "lock", value: "unlocked", descriptionText: "${childDevice.displayName} was unlocked"]])
+    runIn(RELOCK_SECONDS, "relock", [data: [dni: childDevice.deviceNetworkId]])
+}
+
+void componentLock(childDevice) {
+    // The wallpad cannot be locked on command (it auto-relocks); reflect the real door state.
+    unschedule("relock")
+    setLockToDoorState(childDevice)
+}
+
+// After the optimistic unlock window, settle the lock to whatever the door is actually doing.
+void relock(Map data) {
+    def child = getChildDevice(data.dni as String)
+    if (child) setLockToDoorState(child)
+}
+
+// Set a lock child's state from its door magnetic source (open door -> unlocked).
+private void setLockToDoorState(childDevice) {
+    boolean open = doorIsOpen(childDevice.getDataValue("thingId"))
+    childDevice.parse([[name: "lock", value: open ? "unlocked" : "locked",
+                        descriptionText: "${childDevice.displayName} is ${open ? 'unlocked' : 'locked'}"]])
+}
+
+// True if the door magnetic source for this lock currently reads "open".
+private boolean doorIsOpen(String lockThingId) {
+    def src = LOCK_STATE_SOURCE[lockThingId]
+    if (!src) return false
+    def sensor = getChildDevice("${device.deviceNetworkId}-${childNameFor(src.thingId, src.prop, 'contact')}")
+    return sensor?.currentValue("contact") == 'open'
+}
+
+// Mirror a door magnetic update onto the doorlock lock child (detect=open=unlocked,
+// normal=closed=locked). A live sensor reading supersedes the optimistic relock timer.
+private void reflectDoorlockState(String thingId, String propName, value) {
+    LOCK_STATE_SOURCE.each { lockThingId, src ->
+        if (src.thingId != thingId || src.prop != propName) return
+        def lock = getChildDevice("${device.deviceNetworkId}-${thingLevelChildName(lockThingId)}")
+        if (!lock) return
+        unschedule("relock")
+        boolean open = (value == 'detect')
+        lock.parse([[name: "lock", value: open ? "unlocked" : "locked",
+                     descriptionText: "${lock.displayName} ${open ? 'unlocked' : 'locked'} (door ${open ? 'open' : 'closed'})"]])
+    }
 }
 
 private void logDebug(String msg) {
