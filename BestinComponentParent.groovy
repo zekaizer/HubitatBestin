@@ -660,8 +660,9 @@ void componentCycleSpeed(childDevice) {
 }
 
 void componentSetHeatingSetpoint(childDevice, temperature) {
-    // TD: 5..40 in 0.5 steps
-    def target = Math.min(Math.max(Math.round(((temperature as BigDecimal) * 2).doubleValue()) / 2.0d, 5.0d), 40.0d)
+    // Wallpad accepts 5..40 in 0.5 steps, but clamp to the usable heating band 15..30 —
+    // below 15 is never used and it keeps the setpoint in a sensible range.
+    def target = Math.min(Math.max(Math.round(((temperature as BigDecimal) * 2).doubleValue()) / 2.0d, 15.0d), 30.0d)
     sendWotRequest([operation: "writeproperty", thingID: childDevice.getDataValue("thingId"), name: "target", value: target])
 }
 
