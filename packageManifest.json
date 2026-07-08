@@ -2,10 +2,10 @@
 	"packageName": "Hubitat Bestin",
 	"minimumHEVersion": "2.3.9",
 	"author": "Luke Lee",
-	"version": "1.0.0",
-	"dateReleased": "2026-07-08",
+	"version": "1.1.0",
+	"dateReleased": "2026-07-09",
 	"licenseFile": "https://raw.githubusercontent.com/zekaizer/HubitatBestin/main/LICENSE",
-	"releaseNotes": "Migrate from the wallpad imap-XML/TCP protocol to the besthing WoT servient (W3C Web Thing Protocol over WebSocket). Devices are discovered dynamically from the Thing Description catalog; pre-migration child devices keep their DNIs.",
+	"releaseNotes": "Expose the entrance doorlock as a HomeKit lock whose state mirrors the household door magnetic (door open = unlocked, closed = locked), with an optimistic unlock that auto-reconciles to the real door state. Add a newDeviceAllowlist preference to create only selected child devices on discovery. Fix the thermostat off command, which previously sent nothing so heating could not be turned off.",
 	"drivers" : [
 		{
 			"id": "a8bab504-a788-4ba0-8188-9cd85b7ea33a",
