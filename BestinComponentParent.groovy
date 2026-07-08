@@ -625,6 +625,11 @@ private void switchChildTo(child, String value) {
             // Fan Control also exposes Switch: on -> last speed, off -> stop
             componentSetSpeed(child, value)
             break
+        case 'thermostat':
+            // Thermostat on/off is heat/off; the Generic Component Thermostat off()/on()
+            // commands route here via componentOff/componentOn.
+            componentSetThermostatMode(child, value == 'off' ? 'off' : 'heat')
+            break
         default:
             log.warn "on/off not supported for ${child.displayName} (kind ${child.getDataValue('kind')})"
     }
