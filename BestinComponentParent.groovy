@@ -129,6 +129,12 @@ def initialize() {
     state.reconnectDelay = 1
     if (!state.lastFanSpeed) state.lastFanSpeed = "low"
 
+    // Fresh install: installed() fires before preferences are ever saved.
+    if (!settings.ipAddress || !settings.port) {
+        log.warn "ipAddress/port not configured; save preferences to start"
+        return
+    }
+
     runDiscovery()
     connectWebSocket()
 }
@@ -140,7 +146,8 @@ def initialize() {
 private void runDiscovery() {
     def tds = fetchTdCatalog()
     if (tds == null) {
-        log.warn "TD discovery failed; keeping existing children as-is"
+        log.warn "TD discovery failed; keeping existing children as-is (retrying in 60s)"
+        runIn(60, "retryDiscovery")
         return
     }
     tds.each { td ->
@@ -150,6 +157,15 @@ private void runDiscovery() {
             log.error "Discovery failed for ${td.id}: ${e.message}"
         }
     }
+    if (!getChildDevices()) {
+        log.warn "No child devices exist; enable the createNewDevices preference and re-initialize to create the discovered devices"
+    }
+}
+
+// Late-discovery path: the servient's HTTP side was down when initialize() ran.
+def retryDiscovery() {
+    runDiscovery()
+    if (state.connected) observeAll()
 }
 
 private List fetchTdCatalog() {
@@ -168,7 +184,9 @@ private List fetchTdCatalog() {
 
 private void discoverThing(Map td) {
     String thingId = td.id
-    def thingRule = THING_KIND_RULES[td['@type'] as String]
+    // JSON-LD allows @type to be a single string or an array
+    def types = td['@type']
+    def thingRule = (types instanceof List ? types : [types]).findResult { THING_KIND_RULES[it as String] }
     if (thingRule) {
         ensureChildFor(thingId, null, thingRule.kind, thingRule.driver, td.title as String)
         return
@@ -238,7 +256,8 @@ private static String shortThingId(String thingId) {
 }
 
 private static String thingLevelChildName(String thingId) {
-    return LEGACY_ALIASES["${thingId}|__thing__"] ?: shortThingId(thingId)
+    // toString(): a GString key would miss the map's String keys on stock Groovy
+    return LEGACY_ALIASES["${thingId}|__thing__".toString()] ?: shortThingId(thingId)
 }
 
 // The properties a child observes (and refreshes); thing-level kinds have fixed facets.
@@ -258,6 +277,10 @@ private static List<String> observedProps(String kind, String propName) {
 
 def connectWebSocket() {
     unschedule("connectWebSocket")
+    if (!settings.ipAddress || !settings.port) {
+        log.warn "ipAddress/port not configured; skipping WebSocket connect"
+        return
+    }
     state.connecting = true
     state.connected = false
     // Closing a live socket fires webSocketStatus("status: closing"); the connecting
@@ -270,9 +293,19 @@ def connectWebSocket() {
     logDebug "Connecting to ${url}"
     try {
         interfaces.webSocket.connect(url, pingInterval: 30)
+        // Watchdog: a close swallowed during the handshake yields neither open nor
+        // failure, which would otherwise leave the driver disconnected forever.
+        runIn(30, "ensureConnected")
     } catch (Exception e) {
         log.error "WebSocket connect failed: ${e.message}"
         scheduleReconnect()
+    }
+}
+
+def ensureConnected() {
+    if (!state.connected) {
+        log.warn "WebSocket still not connected after 30s; retrying"
+        connectWebSocket()
     }
 }
 
@@ -280,6 +313,7 @@ def webSocketStatus(String message) {
     logDebug "webSocketStatus: ${message}"
     if (message.startsWith("status: open")) {
         unschedule("connectWebSocket")
+        unschedule("ensureConnected")
         state.connecting = false
         state.connected = true
         state.reconnectDelay = 1
@@ -562,6 +596,10 @@ private void switchChildTo(child, String value) {
             // No observable state: the child's switch is set from the invokeaction reply.
             sendWotRequest([operation: "invokeaction", thingID: thingId, name: propName, input: value,
                             correlationID: "${child.deviceNetworkId}|${value}".toString()])
+            break
+        case 'fan':
+            // Fan Control also exposes Switch: on -> last speed, off -> stop
+            componentSetSpeed(child, value)
             break
         default:
             log.warn "on/off not supported for ${child.displayName} (kind ${child.getDataValue('kind')})"
