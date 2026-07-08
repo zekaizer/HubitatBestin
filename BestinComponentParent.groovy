@@ -285,7 +285,7 @@ private static String thingLevelChildName(String thingId) {
 // The properties a child observes (and refreshes); thing-level kinds have fixed facets.
 private static List<String> observedProps(String kind, String propName) {
     switch (kind) {
-        case 'thermostat': return ['current', 'target', 'mode']
+        case 'thermostat': return ['current', 'target', 'operating', 'mode']
         case 'fan': return ['mode']
         case 'valve': return ['valve']
         case 'lock': return []   // momentary release action; no readable state
@@ -467,8 +467,12 @@ private void handleThingUpdate(child, String propName, value) {
                                  [name: "thermostatSetpoint", value: value, unit: "°C"]])
                     break
                 case 'mode':
-                    child.parse([[name: "thermostatMode", value: wotThermoModeToHubitat(value as String)],
-                                 [name: "thermostatOperatingState", value: value == "heat" ? "heating" : "idle"]])
+                    child.parse([[name: "thermostatMode", value: wotThermoModeToHubitat(value as String)]])
+                    break
+                case 'operating':
+                    // Real heating-valve state from the wallpad; authoritative for
+                    // thermostatOperatingState (mode=heat can still be idle between valve cycles).
+                    child.parse([[name: "thermostatOperatingState", value: value as String]])
                     break
             }
             break
