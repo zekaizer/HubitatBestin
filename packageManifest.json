@@ -2,10 +2,10 @@
 	"packageName": "Hubitat Bestin",
 	"minimumHEVersion": "2.3.9",
 	"author": "Luke Lee",
-	"version": "1.1.0",
+	"version": "1.2.0",
 	"dateReleased": "2026-07-09",
 	"licenseFile": "https://raw.githubusercontent.com/zekaizer/HubitatBestin/main/LICENSE",
-	"releaseNotes": "Expose the entrance doorlock as a HomeKit lock whose state mirrors the household door magnetic (door open = unlocked, closed = locked), with an optimistic unlock that auto-reconciles to the real door state. Add a newDeviceAllowlist preference to create only selected child devices on discovery. Fix the thermostat off command, which previously sent nothing so heating could not be turned off.",
+	"releaseNotes": "Drive thermostatOperatingState from the wallpad's new operating property (real boiler-valve heating/idle state) instead of deriving it from the mode, so a room in heat mode correctly shows idle while its setpoint is satisfied.",
 	"drivers" : [
 		{
 			"id": "a8bab504-a788-4ba0-8188-9cd85b7ea33a",
