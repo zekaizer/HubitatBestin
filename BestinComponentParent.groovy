@@ -60,6 +60,7 @@ preferences {
     input name: "ipAddress", type: "text", title: "IP Address", required: true
     input name: "port", type: "number", title: "Port", required: true, defaultValue: 8788
     input name: "createNewDevices", type: "bool", title: "Create child devices for newly discovered affordances", defaultValue: false
+    input name: "newDeviceAllowlist", type: "text", title: "Only create these child names (comma-separated; blank = all)", required: false
     input name: "logEnable", type: "bool", title: "Enable debug logging", defaultValue: true
 }
 
@@ -229,6 +230,12 @@ private void ensureChildFor(String thingId, String prop, String kind, String dri
         // Preferences set through the API may arrive as the STRING "false" (truthy!).
         if (settings.createNewDevices?.toString() != 'true') {
             logDebug "Skipping new device for ${thingId}/${prop ?: kind} (createNewDevices is off)"
+            return
+        }
+        // Optional allowlist: when set, only the listed child names are created.
+        def allow = (settings.newDeviceAllowlist ?: '').split(',')*.trim().findAll { it }
+        if (allow && !(name in allow)) {
+            logDebug "Skipping ${name}: not in newDeviceAllowlist"
             return
         }
         logDebug "Creating child ${dni} (${driver})"
