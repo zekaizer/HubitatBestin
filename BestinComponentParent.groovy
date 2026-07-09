@@ -697,7 +697,8 @@ void componentOpen(childDevice) {
 // door magnetic settle the real state; relock() reconciles if the door never opens.
 void componentUnlock(childDevice) {
     sendWotRequest([operation: "invokeaction", thingID: childDevice.getDataValue("thingId"), name: "open"])
-    childDevice.parse([[name: "lock", value: "unlocked", descriptionText: "${childDevice.displayName} was unlocked"]])
+    // The wrapper handed in by the child's unlock() rejects parse(); use sendEvent like the seed at setup.
+    childDevice.sendEvent(name: "lock", value: "unlocked", descriptionText: "${childDevice.displayName} was unlocked")
     runIn(RELOCK_SECONDS, "relock", [data: [dni: childDevice.deviceNetworkId]])
 }
 
@@ -716,8 +717,9 @@ void relock(Map data) {
 // Set a lock child's state from its door magnetic source (open door -> unlocked).
 private void setLockToDoorState(childDevice) {
     boolean open = doorIsOpen(childDevice.getDataValue("thingId"))
-    childDevice.parse([[name: "lock", value: open ? "unlocked" : "locked",
-                        descriptionText: "${childDevice.displayName} is ${open ? 'unlocked' : 'locked'}"]])
+    // componentLock() passes the child-supplied wrapper, which rejects parse(); use sendEvent.
+    childDevice.sendEvent(name: "lock", value: open ? "unlocked" : "locked",
+                          descriptionText: "${childDevice.displayName} is ${open ? 'unlocked' : 'locked'}")
 }
 
 // True if the door magnetic source for this lock currently reads "open".
