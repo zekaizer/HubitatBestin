@@ -61,6 +61,7 @@ preferences {
     input name: "port", type: "number", title: "Port", required: true, defaultValue: 8788
     input name: "createNewDevices", type: "bool", title: "Create child devices for newly discovered affordances", defaultValue: false
     input name: "newDeviceAllowlist", type: "text", title: "Only create these child names (comma-separated; blank = all)", required: false
+    input name: "linkDoorlockToMagnetic", type: "bool", title: "Reflect the door magnetic reed onto the doorlock's lock state (opt-in)", defaultValue: false
     input name: "logEnable", type: "bool", title: "Enable debug logging", defaultValue: true
 }
 
@@ -723,7 +724,9 @@ private void setLockToDoorState(childDevice) {
 }
 
 // True if the door magnetic source for this lock currently reads "open".
+// With the opt-in link off, the door reed is ignored and the lock settles to "locked".
 private boolean doorIsOpen(String lockThingId) {
+    if (!magneticLinkEnabled()) return false
     def src = LOCK_STATE_SOURCE[lockThingId]
     if (!src) return false
     def sensor = getChildDevice("${device.deviceNetworkId}-${childNameFor(src.thingId, src.prop, 'contact')}")
@@ -733,6 +736,7 @@ private boolean doorIsOpen(String lockThingId) {
 // Mirror a door magnetic update onto the doorlock lock child (detect=open=unlocked,
 // normal=closed=locked). A live sensor reading supersedes the optimistic relock timer.
 private void reflectDoorlockState(String thingId, String propName, value) {
+    if (!magneticLinkEnabled()) return
     LOCK_STATE_SOURCE.each { lockThingId, src ->
         if (src.thingId != thingId || src.prop != propName) return
         def lock = getChildDevice("${device.deviceNetworkId}-${thingLevelChildName(lockThingId)}")
@@ -742,6 +746,12 @@ private void reflectDoorlockState(String thingId, String propName, value) {
         lock.parse([[name: "lock", value: open ? "unlocked" : "locked",
                      descriptionText: "${lock.displayName} ${open ? 'unlocked' : 'locked'} (door ${open ? 'open' : 'closed'})"]])
     }
+}
+
+// Opt-in: mirror the door magnetic reed onto the doorlock's lock state.
+// Preferences set through the API may arrive as the STRING "false" (truthy!).
+private boolean magneticLinkEnabled() {
+    return settings.linkDoorlockToMagnetic?.toString() == 'true'
 }
 
 private void logDebug(String msg) {
