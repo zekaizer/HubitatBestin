@@ -2,10 +2,10 @@
 	"packageName": "Hubitat Bestin",
 	"minimumHEVersion": "2.3.9",
 	"author": "Luke Lee",
-	"version": "1.2.3",
+	"version": "1.2.4",
 	"dateReleased": "2026-07-11",
 	"licenseFile": "https://raw.githubusercontent.com/zekaizer/HubitatBestin/main/LICENSE",
-	"releaseNotes": "Add a linkDoorlockToMagnetic preference (default off) to make the door magnetic reed -> lock state reflection opt-in. When off, the doorlock acts as a pure momentary release and settles back to locked after unlocking.",
+	"releaseNotes": "Add an autoLockSeconds preference (default 10s) to configure the doorlock auto-lock delay after an unlock.",
 	"drivers" : [
 		{
 			"id": "a8bab504-a788-4ba0-8188-9cd85b7ea33a",
