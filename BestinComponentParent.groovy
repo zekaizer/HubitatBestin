@@ -62,6 +62,7 @@ preferences {
     input name: "createNewDevices", type: "bool", title: "Create child devices for newly discovered affordances", defaultValue: false
     input name: "newDeviceAllowlist", type: "text", title: "Only create these child names (comma-separated; blank = all)", required: false
     input name: "linkDoorlockToMagnetic", type: "bool", title: "Reflect the door magnetic reed onto the doorlock's lock state (opt-in)", defaultValue: false
+    input name: "autoLockSeconds", type: "number", title: "Seconds after an unlock before the doorlock auto-locks", defaultValue: 10, range: "1..300"
     input name: "logEnable", type: "bool", title: "Enable debug logging", defaultValue: true
 }
 
@@ -121,7 +122,8 @@ preferences {
 
 // After an optimistic unlock, wait this long before reconciling the lock child to the
 // real door state (in case the door magnetic never reports an opening).
-@Field static final int RELOCK_SECONDS = 5
+// Fallback for the autoLockSeconds preference before it is ever saved.
+@Field static final int RELOCK_SECONDS = 10
 
 def installed() {
     logDebug "installed()"
@@ -700,7 +702,7 @@ void componentUnlock(childDevice) {
     sendWotRequest([operation: "invokeaction", thingID: childDevice.getDataValue("thingId"), name: "open"])
     // The wrapper handed in by the child's unlock() rejects parse(); use sendEvent like the seed at setup.
     childDevice.sendEvent(name: "lock", value: "unlocked", descriptionText: "${childDevice.displayName} was unlocked")
-    runIn(RELOCK_SECONDS, "relock", [data: [dni: childDevice.deviceNetworkId]])
+    runIn(autoLockSeconds(), "relock", [data: [dni: childDevice.deviceNetworkId]])
 }
 
 void componentLock(childDevice) {
@@ -752,6 +754,13 @@ private void reflectDoorlockState(String thingId, String propName, value) {
 // Preferences set through the API may arrive as the STRING "false" (truthy!).
 private boolean magneticLinkEnabled() {
     return settings.linkDoorlockToMagnetic?.toString() == 'true'
+}
+
+// Seconds to wait after an unlock before auto-locking. Falls back to RELOCK_SECONDS
+// before the preference is ever saved or if it is set out of the 1..300 range.
+private int autoLockSeconds() {
+    def secs = settings.autoLockSeconds as Integer
+    return (secs && secs >= 1 && secs <= 300) ? secs : RELOCK_SECONDS
 }
 
 private void logDebug(String msg) {
