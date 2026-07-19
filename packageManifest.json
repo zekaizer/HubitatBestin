@@ -2,10 +2,10 @@
 	"packageName": "Hubitat Bestin",
 	"minimumHEVersion": "2.3.9",
 	"author": "Luke Lee",
-	"version": "1.2.4",
-	"dateReleased": "2026-07-11",
+	"version": "1.2.5",
+	"dateReleased": "2026-07-19",
 	"licenseFile": "https://raw.githubusercontent.com/zekaizer/HubitatBestin/main/LICENSE",
-	"releaseNotes": "Add an autoLockSeconds preference (default 10s) to configure the doorlock auto-lock delay after an unlock.",
+	"releaseNotes": "Fix the HomeKit 100% fan setting reverting: HomeKit sends setSpeed(\"on\") for both the 100% slider and Active=on; disambiguate by context (bare \"on\" while running -> high, while off -> resume last speed, paired with a named speed -> the named speed wins).",
 	"drivers" : [
 		{
 			"id": "a8bab504-a788-4ba0-8188-9cd85b7ea33a",
