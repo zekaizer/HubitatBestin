@@ -633,8 +633,10 @@ private void switchChildTo(child, String value) {
                             correlationID: "${child.deviceNetworkId}|${value}".toString()])
             break
         case 'fan':
-            // Fan Control also exposes Switch: on -> last speed, off -> stop
-            componentSetSpeed(child, value)
+            // Fan Control also exposes Switch: on -> resume last speed, off -> stop.
+            // Only the Switch capability's on() should resume; HomeKit's own "on"
+            // arrives via setSpeed("on") -> componentSetSpeed and maps to max there.
+            componentSetSpeed(child, value == "on" ? (state.lastFanSpeed ?: "high") : value)
             break
         case 'thermostat':
             // Thermostat on/off is heat/off; the Generic Component Thermostat off()/on()
@@ -647,13 +649,33 @@ private void switchChildTo(child, String value) {
 }
 
 void componentSetSpeed(childDevice, speed) {
-    def fanSpeed = speed == "on" ? state.lastFanSpeed : speed
-    def wind = hubitatSpeedToWotWind(fanSpeed as String)
+    // HomeKit drives this fan entirely through setSpeed(): named speeds for the
+    // slider buckets (33/66/99%) and "on" for BOTH Active=on and RotationSpeed=100.
+    // Disambiguate "on" by context:
+    //  - within ~50ms of a named speed (either order) -> the named speed wins
+    //  - "on"+"on" burst = Active=on together with RotationSpeed=100 -> max speed
+    //  - bare "on" while running: only the 100% slider sends this -> max speed
+    //  - bare "on" while off: a plain turn-on (Siri/toggle) -> resume the last speed
+    def wasOn = speed == "on"
+    if (wasOn) {
+        def sinceMs = state.lastSpeedWriteMs ? now() - (state.lastSpeedWriteMs as Long) : Long.MAX_VALUE
+        if (sinceMs < 300) {
+            if (!state.lastSpeedWriteWasOn) return
+            speed = "high"
+        } else if ((childDevice.currentValue("speed") ?: "off") == "off") {
+            speed = state.lastFanSpeed ?: "high"
+        } else {
+            speed = "high"
+        }
+    }
+    def wind = hubitatSpeedToWotWind(speed as String)
     if (!wind) {
         log.warn "Unsupported fan speed: ${speed}"
         return
     }
     if (wind != "off") state.lastFanSpeed = wotWindToSpeed(wind)
+    state.lastSpeedWriteMs = now()
+    state.lastSpeedWriteWasOn = wasOn
     sendWotRequest([operation: "writeproperty", thingID: childDevice.getDataValue("thingId"), name: "mode", value: wind])
 }
 
